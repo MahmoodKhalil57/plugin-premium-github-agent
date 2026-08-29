@@ -210,7 +210,10 @@ export class IssueFixer extends Think<Env> {
 			this.env.CF_ACCOUNT_ID && this.env.CF_API_TOKEN
 				? { accountId: this.env.CF_ACCOUNT_ID, apiToken: this.env.CF_API_TOKEN }
 				: null;
+		await this.ctx.storage.put("ci:running", { attempt: input.attempt, startedAt: new Date().toISOString() });
 		const result = await runCi(this.env.Sandbox, input, host);
+		await this.ctx.storage.put("ci:last", result);
+		await this.ctx.storage.delete("ci:running");
 		const payload = JSON.stringify(result);
 		const sig = await hmac(this.env.AGENT_KEY, payload);
 		for (let i = 0; i < 3; i++) {
@@ -230,6 +233,14 @@ export class IssueFixer extends Think<Env> {
 			}
 			await new Promise((res) => setTimeout(res, 5000 * (i + 1)));
 		}
+	}
+
+	/** The last CI result on this PR (and whether one is in flight). */
+	async ciStatus(): Promise<{ running: unknown; last: unknown }> {
+		return {
+			running: (await this.ctx.storage.get("ci:running")) ?? null,
+			last: (await this.ctx.storage.get("ci:last")) ?? null,
+		};
 	}
 
 	/** Compact transcript: every text + tool part, for operators and the admin page. */
@@ -339,7 +350,7 @@ export default {
 			const body = (await request.json().catch(() => null)) as Partial<CiInput> | null;
 			const need = ["owner", "repo", "headRef", "headSha", "staticBranch", "token", "backendUrl", "siteUrl", "callbackUrl"] as const;
 			if (!body || typeof body.pr !== "number" || need.some((k) => typeof body[k] !== "string")) {
-				return json({ error: `pr (number) and ${need.join(", ")} are required` }, 400);
+				return json({ error: `pr (number, 0 for a branch build) and ${need.join(", ")} are required` }, 400);
 			}
 			const input: CiInput = {
 				owner: body.owner!,
@@ -354,8 +365,10 @@ export default {
 				previewSecret: typeof body.previewSecret === "string" ? body.previewSecret : "",
 				siteUrl: body.siteUrl!,
 				callbackUrl: body.callbackUrl!,
+				preview: body.preview !== false,
 			};
-			const agent = await getAgentByName(env.IssueFixer, `ci:${nameFor(input.owner, input.repo, input.pr)}`);
+			const key = input.pr > 0 ? nameFor(input.owner, input.repo, input.pr) : `${input.owner}/${input.repo}@${input.headRef}`.toLowerCase();
+			const agent = await getAgentByName(env.IssueFixer, `ci:${key}`);
 			return json(await agent.startCi(input), 202);
 		}
 
@@ -369,6 +382,17 @@ export default {
 			}
 			const agent = await getAgentByName(env.IssueFixer, nameFor(owner, repo, issue));
 			return json(await agent.status(id));
+		}
+
+		if (request.method === "GET" && url.pathname === "/ci/status") {
+			const owner = url.searchParams.get("owner") ?? "";
+			const repo = url.searchParams.get("repo") ?? "";
+			const pr = Number(url.searchParams.get("pr") ?? "0");
+			const branch = url.searchParams.get("branch") ?? "";
+			if (!owner || !repo || (!(pr > 0) && !branch)) return json({ error: "owner, repo and pr or branch required" }, 400);
+			const key = pr > 0 ? nameFor(owner, repo, pr) : `${owner}/${repo}@${branch}`.toLowerCase();
+			const agent = await getAgentByName(env.IssueFixer, `ci:${key}`);
+			return json(await agent.ciStatus());
 		}
 
 		// Remove a PR's preview Worker (the PR was closed or merged).

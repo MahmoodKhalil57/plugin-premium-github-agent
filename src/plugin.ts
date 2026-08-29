@@ -35,12 +35,14 @@ import {
 } from "./agent.js";
 import {
 	addLabels,
+	branchHead,
 	comment,
 	createIssue,
 	getConnection,
 	getIssue,
 	getPull,
 	listIssues,
+	servePagesFromBranch,
 	setStatus,
 	type Connection,
 	type Issue,
@@ -211,7 +213,12 @@ function issueNumberFromEvent(input: unknown): { action: string; number: number;
 
 type BuildStatus = "running" | "passed" | "failed" | "error" | "capped" | "closed";
 
-/** One row per PR in the `builds` storage: the latest CI attempt and its outcome. */
+/** Storage id of the default-branch build row. */
+function branchBuildId(branch: string): string {
+	return `branch:${branch}`;
+}
+
+/** One row per PR (or per built branch, `pr: 0`) in the `builds` storage: the latest CI attempt and its outcome. */
 interface Build {
 	pr: number;
 	title: string;
@@ -228,6 +235,8 @@ interface Build {
 	summary?: string;
 	/** Issue the PR fixes when the branch is the agent's (`agent/issue-N-…`). */
 	issue?: number;
+	/** Branch builds: another build was requested while this one ran. */
+	rebuild?: boolean;
 	updatedAt: string;
 }
 
@@ -235,13 +244,22 @@ function isBuild(v: unknown): v is Build {
 	return isRecord(v) && typeof v.pr === "number" && typeof v.status === "string";
 }
 
+function buildId(b: { pr: number; headRef: string }): string {
+	return b.pr > 0 ? String(b.pr) : branchBuildId(b.headRef);
+}
+
 async function getBuild(ctx: PluginContext, pr: number): Promise<Build | null> {
 	const row = await ctx.storage.builds!.get(String(pr));
 	return isBuild(row) ? row : null;
 }
 
+async function getBranchBuild(ctx: PluginContext, branch: string): Promise<Build | null> {
+	const row = await ctx.storage.builds!.get(branchBuildId(branch));
+	return isBuild(row) ? row : null;
+}
+
 async function putBuild(ctx: PluginContext, b: Build): Promise<void> {
-	await ctx.storage.builds!.put(String(b.pr), { ...b, updatedAt: now() });
+	await ctx.storage.builds!.put(buildId(b), { ...b, updatedAt: now() });
 }
 
 async function listBuilds(ctx: PluginContext, limit = 50): Promise<Build[]> {
@@ -429,6 +447,94 @@ async function recordCi(ctx: PluginContext, settings: Settings, conn: Connection
 	return next;
 }
 
+/**
+ * Build the default branch and publish it to `static/<branch>`, which GitHub
+ * Pages serves. Triggered by pushes to the branch and by content publishes.
+ * Builds coalesce: a request during a running build re-runs it once after.
+ */
+async function buildDefaultBranch(
+	ctx: PluginContext,
+	settings: Settings,
+	conn: Connection,
+	why: string,
+): Promise<{ started: boolean; reason?: string }> {
+	if (!settings.agentKey) return { started: false, reason: "Agent key is not set in the plugin settings" };
+	const branch = conn.branch;
+	const existing = await getBranchBuild(ctx, branch);
+	if (existing?.status === "running") {
+		await putBuild(ctx, { ...existing, rebuild: true });
+		return { started: false, reason: "build in progress — queued a rebuild" };
+	}
+	const sha = (await branchHead(ctx, conn, branch)) ?? "";
+	const build: Build = {
+		pr: 0,
+		title: `${branch} (${why})`,
+		author: conn.owner,
+		headRef: branch,
+		headSha: sha,
+		staticBranch: staticBranchFor(branch),
+		staticSha: existing?.staticSha,
+		attempt: (existing?.attempt ?? 0) + 1,
+		status: "running",
+		updatedAt: now(),
+	};
+	await putBuild(ctx, build);
+	try {
+		await dispatchCi(ctx, settings, conn, {
+			pr: 0,
+			headRef: branch,
+			headSha: sha,
+			attempt: build.attempt,
+			staticBranch: build.staticBranch,
+			backendUrl: ctx.site.url,
+			siteUrl: ctx.site.url,
+			callbackUrl: ciCallbackUrl(ctx),
+			preview: false,
+		});
+		return { started: true };
+	} catch (error) {
+		await putBuild(ctx, { ...build, status: "error", summary: String(error) });
+		ctx.log.error(`branch ${branch}: ci dispatch failed`, error);
+		return { started: false, reason: String(error) };
+	}
+}
+
+/** A branch build finished: record it, switch Pages to the static branch once, honour queued rebuilds. */
+async function recordBranchCi(ctx: PluginContext, settings: Settings, conn: Connection, r: CiResult): Promise<Build | null> {
+	const build = await getBranchBuild(ctx, r.branch);
+	if (!build || build.attempt !== r.attempt || build.status !== "running") return build;
+	const next: Build = {
+		...build,
+		status: r.ok ? "passed" : "failed",
+		staticSha: r.staticSha ?? build.staticSha,
+		summary: r.ok ? `published to ${r.staticBranch}` : (firstFailure(r)?.name ?? r.error ?? "failed"),
+		rebuild: false,
+	};
+	await putBuild(ctx, next);
+	if (r.headSha) {
+		await setStatus(ctx, conn, r.headSha, {
+			state: r.ok ? "success" : "failure",
+			context: STATUS_CONTEXT,
+			description: r.ok ? `built → ${r.staticBranch}` : `${next.summary} (attempt ${r.attempt})`,
+			targetUrl: `https://github.com/${conn.owner}/${conn.repo}/tree/${r.staticBranch}`,
+		}).catch(() => undefined);
+	}
+	if (r.ok && r.staticSha) {
+		const pages: { ok: boolean; url?: string; error?: string } = await servePagesFromBranch(ctx, conn, r.staticBranch).catch(
+			(e) => ({ ok: false, error: String(e) }),
+		);
+		if (!pages.ok) ctx.log.warn(`Pages source not switched to ${r.staticBranch}: ${pages.error}`);
+		else if (pages.url) await ctx.kv.set("pages:url", pages.url);
+	}
+	if (build.rebuild) await buildDefaultBranch(ctx, settings, conn, "queued rebuild");
+	return next;
+}
+
+function pushFromEvent(input: unknown): { branch: string; after: string; deleted: boolean } | null {
+	if (!isRecord(input) || typeof input.ref !== "string" || !input.ref.startsWith("refs/heads/")) return null;
+	return { branch: input.ref.slice("refs/heads/".length), after: String(input.after ?? ""), deleted: input.deleted === true };
+}
+
 function pullFromEvent(input: unknown): { action: string; number: number; headSha: string; author: string } | null {
 	if (!isRecord(input) || !isRecord(input.pull_request)) return null;
 	const pr = input.pull_request;
@@ -450,6 +556,15 @@ const plugin: SandboxedPlugin = {
 			}
 			ctx.log.info("GitHub agent installed");
 		},
+
+		// Publishing content changes the static site: rebuild the default
+		// branch (coalesced) so `static/<branch>` — what Pages serves — follows.
+		"content:afterPublish": async (_event, ctx) => {
+			const setup = await requireSetup(ctx);
+			if (!setup.ok || !setup.settings.enabled) return;
+			const r = await buildDefaultBranch(ctx, setup.settings, setup.conn, "content published");
+			if (!r.started && r.reason) ctx.log.info(`rebuild not started: ${r.reason}`);
+		},
 	},
 
 	routes: {
@@ -460,6 +575,17 @@ const plugin: SandboxedPlugin = {
 		 */
 		webhook: {
 			handler: async (routeCtx, ctx) => {
+				const push = pushFromEvent(routeCtx.input);
+				if (push) {
+					const setup = await requireSetup(ctx);
+					if (!setup.ok) return { success: false, error: setup.error };
+					if (!setup.settings.enabled) return { success: true, ignored: "disabled" };
+					if (push.deleted || push.branch !== setup.conn.branch) {
+						return { success: true, ignored: `push to ${push.branch}` };
+					}
+					const r = await buildDefaultBranch(ctx, setup.settings, setup.conn, `push ${push.after.slice(0, 7)}`);
+					return { success: true, branch: push.branch, started: r.started, reason: r.reason };
+				}
 				const pull = pullFromEvent(routeCtx.input);
 				if (pull) {
 					const setup = await requireSetup(ctx);
@@ -546,8 +672,18 @@ const plugin: SandboxedPlugin = {
 				if (!timingSafeEqual(given, expected)) return { success: false, error: "bad signature" };
 				const conn = await getConnection(ctx);
 				if (!conn) return { success: false, error: "GitHub not connected" };
-				const build = await recordCi(ctx, settings, conn, r);
+				const build = r.pr > 0 ? await recordCi(ctx, settings, conn, r) : await recordBranchCi(ctx, settings, conn, r);
 				return { success: true, status: build?.status ?? "unknown" };
+			},
+		},
+
+		/** Build the default branch now and publish it to static/<branch>. */
+		"site/build": {
+			handler: async (_routeCtx, ctx) => {
+				const setup = await requireSetup(ctx);
+				if (!setup.ok) return { success: false, error: setup.error };
+				const r = await buildDefaultBranch(ctx, setup.settings, setup.conn, "manual");
+				return { success: r.started, reason: r.reason, build: await getBranchBuild(ctx, setup.conn.branch) };
 			},
 		},
 
@@ -729,6 +865,12 @@ const plugin: SandboxedPlugin = {
 					const r = await buildPull(ctx, setup.settings, setup.conn, pr, { force: i.values?.force === true });
 					return buildPage(ctx, r.started ? `PR #${number}: ${r.build?.status ?? "built"} (attempt ${r.build?.attempt}).` : `PR #${number}: ${r.reason}`);
 				}
+				if (i.type === "block_action" && i.action_id === "build_site") {
+					const setup = await requireSetup(ctx);
+					if (!setup.ok) return buildPage(ctx, setup.error);
+					const r = await buildDefaultBranch(ctx, setup.settings, setup.conn, "manual");
+					return buildPage(ctx, r.started ? `Building ${setup.conn.branch}…` : `Not started: ${r.reason}`);
+				}
 				if (i.type === "block_action" && i.action_id === "poll_now") {
 					const r = await poll(ctx);
 					return buildPage(ctx, r.error ?? `Reconciled: ${r.dispatched} dispatched, ${r.refreshed} updated.`);
@@ -807,9 +949,20 @@ async function buildPage(ctx: PluginContext, notice?: string) {
 				{ label: "PRs opened", value: [...runs.values()].filter((r) => r.prUrl).length, description: `${done} runs finished` },
 			],
 		});
+		const site = await getBranchBuild(ctx, conn.branch);
+		const pagesUrl = await ctx.kv.get<string>("pages:url");
+		blocks.push({
+			type: "context",
+			text: site
+				? `Site (${conn.branch}): ${site.status}${site.summary ? ` — ${site.summary}` : ""}${site.staticSha ? ` @ ${site.staticSha.slice(0, 7)}` : ""}${pagesUrl ? ` · served by GitHub Pages from ${site.staticBranch} (${pagesUrl})` : ""}`
+				: `Site (${conn.branch}): not built by the platform yet — pushes to ${conn.branch} and content publishes build it to ${staticBranchFor(conn.branch)}.`,
+		});
 		blocks.push({
 			type: "actions",
-			elements: [{ type: "button", action_id: "poll_now", label: "Reconcile now", style: "secondary" }],
+			elements: [
+				{ type: "button", action_id: "build_site", label: `Build ${conn.branch} now`, style: "primary" },
+				{ type: "button", action_id: "poll_now", label: "Reconcile now", style: "secondary" },
+			],
 		});
 		blocks.push({ type: "divider" });
 		blocks.push({
@@ -859,7 +1012,7 @@ async function buildPage(ctx: PluginContext, notice?: string) {
 				{ key: "updated", label: "Updated", format: "relative_time" },
 			],
 			rows: builds.map((b) => ({
-				pr: `#${b.pr}`,
+				pr: b.pr > 0 ? `#${b.pr}` : b.headRef,
 				title: b.title,
 				branch: b.headRef,
 				status: b.status,

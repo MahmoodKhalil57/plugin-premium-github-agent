@@ -74,6 +74,8 @@ export interface CiStep {
 /** What the agent worker POSTs to `ci-callback` (and returns from `/ci`). */
 export interface CiResult {
 	pr: number;
+	/** The branch that was built. */
+	branch: string;
 	attempt: number;
 	headSha: string;
 	staticBranch: string;
@@ -92,6 +94,7 @@ export interface CiResult {
 export function canonicalCi(r: CiResult): string {
 	return JSON.stringify({
 		pr: r.pr,
+		branch: r.branch,
 		attempt: r.attempt,
 		headSha: r.headSha,
 		staticBranch: r.staticBranch,
@@ -128,6 +131,7 @@ export async function dispatchCi(
 		backendUrl: string;
 		siteUrl: string;
 		callbackUrl: string;
+		preview?: boolean;
 	},
 ): Promise<void> {
 	const r = await call(ctx, settings, "POST", "/ci", {

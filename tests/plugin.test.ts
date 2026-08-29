@@ -61,7 +61,7 @@ function pull(n: number, author: string, headRef: string, sha = "abc1234") {
 
 function ciResult(pr: number, attempt: number, ok: boolean) {
 	const step = (k: boolean) => ({ ok: k, log: k ? "fine" : "boom", seconds: 1 });
-	return { pr, attempt, headSha: "abc1234", staticBranch: "static/agent/issue-1-x", staticSha: ok ? "def5678" : null, check: step(true), build: step(ok), push: ok ? step(true) : null, test: ok ? step(true) : null, preview: ok ? step(true) : null, previewUrl: ok ? `https://preview-acme-site-pr${pr}.example.workers.dev` : null, ok, ...(ok ? {} : { error: "build failed" }) };
+	return { pr, branch: "agent/issue-1-x", attempt, headSha: "abc1234", staticBranch: "static/agent/issue-1-x", staticSha: ok ? "def5678" : null, check: step(true), build: step(ok), push: ok ? step(true) : null, test: ok ? step(true) : null, preview: ok ? step(true) : null, previewUrl: ok ? `https://preview-acme-site-pr${pr}.example.workers.dev` : null, ok, ...(ok ? {} : { error: "build failed" }) };
 }
 
 const conn = { token: "gho_x", owner: "acme", repo: "site", branch: "main", previewSecret: "prev" };
@@ -307,5 +307,69 @@ describe("pull requests", () => {
 		const r = (await route("webhook")({ input: { action: "opened", pull_request: pull(12, "mallory", "feature") } }, ctx)) as { started: boolean };
 		expect(r.started).toBe(false);
 		expect(calls.some((c) => c.url.endsWith("/ci"))).toBe(false);
+	});
+});
+
+describe("default branch", () => {
+	function branchResult(attempt: number, ok: boolean) {
+		const step = (k: boolean) => ({ ok: k, log: k ? "fine" : "boom", seconds: 1 });
+		return { pr: 0, branch: "main", attempt, headSha: "mainsha", staticBranch: "static/main", staticSha: ok ? "stat123" : null, check: step(true), build: step(ok), push: ok ? step(true) : null, test: ok ? step(true) : null, preview: null, previewUrl: null, ok, ...(ok ? {} : { error: "build failed" }) };
+	}
+
+	it("builds main on push, then switches Pages to static/main when it passes", async () => {
+		const pagesCalls: Array<{ method?: string; body: unknown }> = [];
+		const { ctx, builds, calls } = ctxWith({
+			github: conn,
+			settings,
+			fetch: async (url, init) => {
+				if (url.endsWith("/branches/main")) return Response.json({ commit: { sha: "mainsha" } });
+				if (url.endsWith("/ci")) return Response.json({ accepted: true }, { status: 202 });
+				if (url.endsWith("/pages")) {
+					if ((init?.method ?? "GET") === "GET") return Response.json({ build_type: "workflow", source: { branch: "main", path: "/" }, html_url: "https://acme.github.io/site/" });
+					pagesCalls.push({ method: init?.method, body: JSON.parse(String(init?.body)) });
+					return new Response(null, { status: 204 });
+				}
+				return Response.json({});
+			},
+		});
+		const r = (await route("webhook")({ input: { ref: "refs/heads/main", after: "mainsha", repository: { full_name: "acme/site" } } }, ctx)) as { started: boolean };
+		expect(r.started).toBe(true);
+		const ci = JSON.parse(String(calls.find((c) => c.url.endsWith("/ci"))?.init?.body));
+		expect(ci).toMatchObject({ pr: 0, headRef: "main", staticBranch: "static/main", preview: false });
+		await route("ci-callback")(await signedCi(branchResult(1, true)), ctx);
+		expect(builds.get("branch:main")).toMatchObject({ status: "passed", staticSha: "stat123" });
+		expect(pagesCalls).toEqual([{ method: "PUT", body: { build_type: "legacy", source: { branch: "static/main", path: "/" } } }]);
+	});
+
+	it("ignores pushes to other branches and to static/*", async () => {
+		const { ctx, calls } = ctxWith({ github: conn, settings });
+		for (const ref of ["refs/heads/static/main", "refs/heads/feature", "refs/tags/v1"]) {
+			await route("webhook")({ input: { ref, after: "x", repository: { full_name: "acme/site" } } }, ctx);
+		}
+		expect(calls.some((c) => c.url.endsWith("/ci"))).toBe(false);
+	});
+
+	it("coalesces a publish during a running build into one rebuild", async () => {
+		let ciCalls = 0;
+		const { ctx } = ctxWith({
+			github: conn,
+			settings,
+			fetch: async (url, init) => {
+				if (url.endsWith("/branches/main")) return Response.json({ commit: { sha: "mainsha" } });
+				if (url.endsWith("/ci")) {
+					ciCalls++;
+					return Response.json({ accepted: true }, { status: 202 });
+				}
+				if (url.endsWith("/pages") && (init?.method ?? "GET") === "GET") return Response.json({ build_type: "legacy", source: { branch: "static/main", path: "/" }, html_url: "https://acme.github.io/site/" });
+				return Response.json({});
+			},
+		});
+		const hook = plugin.hooks!["content:afterPublish"] as (event: unknown, ctx: unknown) => Promise<void>;
+		await hook({}, ctx);
+		await hook({}, ctx);
+		await hook({}, ctx);
+		expect(ciCalls).toBe(1);
+		await route("ci-callback")(await signedCi(branchResult(1, true)), ctx);
+		expect(ciCalls).toBe(2);
 	});
 });

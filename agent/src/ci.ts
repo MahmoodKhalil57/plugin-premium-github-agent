@@ -13,9 +13,10 @@ import { getSandbox, type Sandbox } from "@cloudflare/sandbox";
 export interface CiInput {
 	owner: string;
 	repo: string;
-	/** PR head branch (the fix branch). */
+	/** Branch to build: a PR head, or the default branch for a `branch` build. */
 	headRef: string;
 	headSha: string;
+	/** Pull request number; 0 for a plain branch build (e.g. the default branch). */
 	pr: number;
 	attempt: number;
 	/** Branch that receives dist/ (force-pushed each run). */
@@ -25,6 +26,8 @@ export interface CiInput {
 	previewSecret: string;
 	siteUrl: string;
 	callbackUrl: string;
+	/** Host the passing build as a preview Worker (PR builds only). */
+	preview?: boolean;
 }
 
 export interface StepResult {
@@ -36,6 +39,8 @@ export interface StepResult {
 
 export interface CiResult {
 	pr: number;
+	/** The branch that was built. */
+	branch: string;
 	attempt: number;
 	headSha: string;
 	staticBranch: string;
@@ -93,6 +98,7 @@ export async function runCi(
 ): Promise<CiResult> {
 	const out: CiResult = {
 		pr: input.pr,
+		branch: input.headRef,
 		attempt: input.attempt,
 		headSha: input.headSha,
 		staticBranch: input.staticBranch,
@@ -177,7 +183,7 @@ export async function runCi(
 			[
 				`rm -rf ${OUT} && mkdir -p ${OUT} && cp -r ${WORK}/dist/. ${OUT}/`,
 				`cd ${OUT} && git init -q -b "${input.staticBranch}" && touch .nojekyll`,
-				`git add -A && git commit -q -m "static build of ${input.headRef} @ ${input.headSha.slice(0, 7)} (PR #${input.pr}, attempt ${input.attempt})"`,
+				`git add -A && git commit -q -m "static build of ${input.headRef} @ ${input.headSha.slice(0, 7)} (${input.pr ? `PR #${input.pr}` : "branch"}, attempt ${input.attempt})"`,
 				`git push -q --force "${repoUrl}" "HEAD:refs/heads/${input.staticBranch}" && git rev-parse HEAD`,
 			].join(" && "),
 			{ cwd: "/workspace", env: gitEnv, timeout: 5 * 60_000 },
@@ -197,7 +203,7 @@ export async function runCi(
 		// Tests passed: host the exact bytes that went to the static branch as an
 		// assets-only Worker on the platform account. The config never touches
 		// the static branch (it is written after the push).
-		if (host) {
+		if (host && input.preview !== false && input.pr > 0) {
 			const name = previewWorkerName(input.owner, input.repo, input.pr);
 			await sb.writeFile(
 				`${OUT}/wrangler.preview.jsonc`,

@@ -196,3 +196,35 @@ export async function setStatus(
 	});
 	return r.ok;
 }
+
+/**
+ * Point GitHub Pages at a branch (legacy "deploy from a branch" build) so the
+ * platform-built static branch is what the site serves. Returns the Pages URL.
+ */
+export async function servePagesFromBranch(
+	ctx: PluginContext,
+	conn: Connection,
+	branch: string,
+): Promise<{ ok: boolean; url?: string; error?: string }> {
+	const current = await gh(ctx, conn, "GET", `/repos/${conn.owner}/${conn.repo}/pages`);
+	const cfg = (current.ok ? current.json : null) as { html_url?: string; build_type?: string; source?: { branch?: string; path?: string } } | null;
+	if (cfg?.build_type === "legacy" && cfg.source?.branch === branch && (cfg.source.path ?? "/") === "/") {
+		return { ok: true, url: cfg.html_url };
+	}
+	const body = { build_type: "legacy", source: { branch, path: "/" } };
+	const r = current.status === 404
+		? await gh(ctx, conn, "POST", `/repos/${conn.owner}/${conn.repo}/pages`, body)
+		: await gh(ctx, conn, "PUT", `/repos/${conn.owner}/${conn.repo}/pages`, body);
+	if (!r.ok && r.status !== 204) {
+		const msg = (r.json as { message?: string } | null)?.message ?? "";
+		return { ok: false, error: `GitHub ${r.status} configuring Pages${msg ? `: ${msg}` : ""}` };
+	}
+	const after = await gh(ctx, conn, "GET", `/repos/${conn.owner}/${conn.repo}/pages`);
+	return { ok: true, url: (after.json as { html_url?: string } | null)?.html_url };
+}
+
+export async function branchHead(ctx: PluginContext, conn: Connection, branch: string): Promise<string | null> {
+	const r = await gh(ctx, conn, "GET", `/repos/${conn.owner}/${conn.repo}/branches/${encodeURIComponent(branch)}`);
+	if (!r.ok) return null;
+	return String((r.json as { commit?: { sha?: string } })?.commit?.sha ?? "") || null;
+}
