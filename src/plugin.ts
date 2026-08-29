@@ -432,7 +432,9 @@ async function recordCi(ctx: PluginContext, settings: Settings, conn: Connection
 	}).catch(() => undefined);
 
 	if (r.ok && settings.autoMerge) {
-		const m = await mergePull(ctx, conn, r.pr, build.title).catch((e) => ({ merged: false, message: String(e) }));
+		const m: { merged: boolean; sha?: string; message: string } = await mergePull(ctx, conn, r.pr, build.title).catch(
+			(e) => ({ merged: false, message: String(e) }),
+		);
 		if (m.merged) {
 			next = { ...next, status: "merged", summary: `merged into ${conn.branch}${m.sha ? ` @ ${m.sha.slice(0, 7)}` : ""}` };
 			await putBuild(ctx, next);
