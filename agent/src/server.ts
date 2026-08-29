@@ -121,6 +121,26 @@ export class IssueFixer extends Think<Env> {
 		return { submissionId: res.submissionId, accepted: res.accepted };
 	}
 
+	/** Compact transcript: every text + tool part, for operators and the admin page. */
+	async transcript(limit = 60): Promise<Array<{ role: string; type: string; text: string }>> {
+		const out: Array<{ role: string; type: string; text: string }> = [];
+		for (const m of this.messages) {
+			for (const p of m.parts as Array<Record<string, unknown>>) {
+				const type = String(p.type ?? "");
+				if (type === "text") out.push({ role: m.role, type, text: String(p.text ?? "").slice(0, 600) });
+				else if (type.startsWith("tool-") || type === "dynamic-tool") {
+					const name = String(p.toolName ?? type.replace(/^tool-/, ""));
+					const state = String(p.state ?? "");
+					const input = JSON.stringify(p.input ?? {}).slice(0, 300);
+					const output = p.output !== undefined ? JSON.stringify(p.output).slice(0, 300) : "";
+					const err = p.errorText ? ` error=${String(p.errorText).slice(0, 200)}` : "";
+					out.push({ role: m.role, type: "tool", text: `${name} [${state}] ${input}${output ? ` → ${output}` : ""}${err}` });
+				} else if (type === "reasoning") out.push({ role: m.role, type, text: String(p.text ?? "").slice(0, 200) });
+			}
+		}
+		return out.slice(-limit);
+	}
+
 	/** Terminal status + the model's final answer (PR url or NO_PR: reason). */
 	async status(submissionId: string): Promise<{
 		status: string;
@@ -197,6 +217,15 @@ export default {
 			}
 			const agent = await getAgentByName(env.IssueFixer, nameFor(owner, repo, issue));
 			return json(await agent.status(id));
+		}
+
+		if (request.method === "GET" && url.pathname === "/transcript") {
+			const owner = url.searchParams.get("owner") ?? "";
+			const repo = url.searchParams.get("repo") ?? "";
+			const issue = Number(url.searchParams.get("issue"));
+			if (!owner || !repo || !Number.isFinite(issue)) return json({ error: "owner, repo, issue required" }, 400);
+			const agent = await getAgentByName(env.IssueFixer, nameFor(owner, repo, issue));
+			return json({ items: await agent.transcript(Number(url.searchParams.get("limit")) || 60) });
 		}
 
 		return json({ error: "not found" }, 404);
