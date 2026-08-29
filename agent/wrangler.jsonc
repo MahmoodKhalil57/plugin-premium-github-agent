@@ -20,7 +20,7 @@
 			"class_name": "Sandbox",
 			"image": "docker.io/cloudflare/sandbox:0.12.9",
 			"instance_type": "basic",
-			"max_instances": 3
+			"max_instances": 10
 		}
 	],
 	"observability": { "enabled": true }

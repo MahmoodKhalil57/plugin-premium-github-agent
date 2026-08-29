@@ -15,7 +15,7 @@ import { skills } from "@cloudflare/think";
 
 import { Sandbox } from "@cloudflare/sandbox";
 
-import { previewWorkerName, runCi, type CiInput, type CiStage, type StepResult } from "./ci.js";
+import { isCapacityError, previewWorkerName, runCi, type CiInput, type CiStage, type StepResult } from "./ci.js";
 import { loadRepoContext, type RepoContext } from "./repo-context.js";
 import { FIX_ISSUE_SKILL } from "./skill.js";
 
@@ -228,11 +228,11 @@ export class IssueFixer extends Think<Env> {
 	 * signs and POSTs the result to the plugin when done.
 	 */
 	async startCi(input: CiInput): Promise<{ accepted: true }> {
-		await this.schedule(1, "ciJob", input);
+		await this.schedule(1, "ciJob", { ...input, waits: 0 });
 		return { accepted: true };
 	}
 
-	async ciJob(input: CiInput): Promise<void> {
+	async ciJob(input: CiInput & { waits?: number }): Promise<void> {
 		const host =
 			this.env.CF_ACCOUNT_ID && this.env.CF_API_TOKEN
 				? { accountId: this.env.CF_ACCOUNT_ID, apiToken: this.env.CF_API_TOKEN }
@@ -264,6 +264,11 @@ export class IssueFixer extends Think<Env> {
 			}).catch(() => undefined);
 		};
 		const result = await runCi(this.env.Sandbox, input, host, input.pr > 0 ? report : undefined);
+		// No container slot: wait for one instead of failing the build (up to ~30 min).
+		if (!result.ok && isCapacityError(result.error) && (input.waits ?? 0) < 30) {
+			await this.schedule(60, "ciJob", { ...input, waits: (input.waits ?? 0) + 1 });
+			return;
+		}
 		await this.ctx.storage.put("ci:last", result);
 		await this.ctx.storage.delete("ci:running");
 		const payload = JSON.stringify(result);

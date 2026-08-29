@@ -239,6 +239,18 @@ describe("/awaiting-test and the runner's reports", () => {
 		expect(calls.some((c) => c.url.endsWith("/run") || c.url.endsWith("/ci"))).toBe(false);
 	});
 
+	it("reports a platform error that stopped the run before any stage, without summoning the agent", async () => {
+		const { ctx, builds, calls } = ctxWith({ github: conn, settings, fetch: passing(15) });
+		await route("webhook")(commentEvent(15, "alice", "/awaiting-test", true), ctx);
+		const dead = { ...ciResult(15, 1, false), check: null, build: null, error: "ContainerUnavailableError: Maximum number of running container instances exceeded" };
+		await route("ci-callback")(await signed(dead, canonicalCi), ctx);
+		expect(builds.get("15")?.status).toBe("error");
+		const posted = commentsPosted(calls, 15);
+		expect(posted.length).toBe(1);
+		expect(posted[0]).toMatch(/Platform error/);
+		expect(posted[0]).not.toMatch(/(^|\s)\/awaiting-test/);
+	});
+
 	it("rejects stage and result callbacks with a bad signature", async () => {
 		const { ctx, calls } = ctxWith({ github: conn, settings });
 		const a = (await route("ci-stage")(await signed({ pr: 1, branch: "b", attempt: 1, headSha: "s", stage: "check", ok: true, log: "", seconds: 1, previewUrl: null }, canonicalStage, "wrong"), ctx)) as { success: boolean };

@@ -106,6 +106,11 @@ async function waitForPreview(url: string): Promise<void> {
 	}
 }
 
+/** A transient platform condition (no container slot free right now). */
+export function isCapacityError(message: string | undefined): boolean {
+	return /ContainerUnavailableError|Maximum number of running container/i.test(message ?? "");
+}
+
 /** Stage names reported while a run progresses (each maps to a PR comment command). */
 export type CiStage = "check" | "test" | "preview" | "previewTest";
 export type StageReporter = (stage: CiStage, result: StepResult, extra?: { previewUrl?: string }) => Promise<void>;
@@ -132,7 +137,7 @@ export async function runCi(
 		previewTest: null,
 		ok: false,
 	};
-	const sb = getSandbox(ns, `${input.owner}/${input.repo}#${input.pr}`.toLowerCase(), { sleepAfter: "5m" });
+	const sb = getSandbox(ns, `${input.owner}/${input.repo}#${input.pr || input.headRef}`.toLowerCase(), { sleepAfter: "2m" });
 	const repoUrl = `https://github.com/${input.owner}/${input.repo}.git`;
 	// Credentials only ever travel through the environment of each command.
 	const gitEnv = {

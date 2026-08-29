@@ -465,6 +465,20 @@ async function recordCi(ctx: PluginContext, settings: Settings, conn: Connection
 		targetUrl: r.previewUrl ?? `https://github.com/${conn.owner}/${conn.repo}/pull/${r.pr}`,
 	}).catch(() => undefined);
 
+	// A run that died before any stage ran (platform trouble, not the code):
+	// say so on the PR; the stage reports never had a chance to.
+	if (!r.ok && !firstFailure(r)) {
+		next = { ...next, status: "error" };
+		await putBuild(ctx, next);
+		await comment(
+			ctx,
+			conn,
+			r.pr,
+			`Platform error while building attempt ${r.attempt}: ${r.error ?? "unknown"}. Nothing was tested. Comment \`/awaiting-test\` to try again.`,
+		).catch(() => undefined);
+		return next;
+	}
+
 	if (next.status === "capped") {
 		await comment(ctx, conn, r.pr, `Build attempts exhausted (${settings.maxBuildAttempts}); a human needs to take it from here.`).catch(() => undefined);
 	}
