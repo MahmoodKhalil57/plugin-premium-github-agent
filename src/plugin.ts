@@ -773,8 +773,9 @@ const STACK_TICK_SCHEDULE = "*/2 * * * *";
 const FRESH_PR_MS = 10 * 60 * 1000;
 /** A rebased layer whose branch has not moved after this long: a conflict, most likely. */
 const REBASE_WAIT_MS = 15 * 60 * 1000;
-/** How many 2-second polls a route gives GitHub's asynchronous merge before leaving it to the tick. */
-const MERGE_POLLS = 5;
+/** How many polls (MERGE_POLL_MS apart) a route gives GitHub's asynchronous merge before leaving it to the tick and the `closed` webhooks. */
+const MERGE_POLLS = 8;
+const MERGE_POLL_MS = 2500;
 
 function isStack(v: unknown): v is Stack {
 	return isRecord(v) && typeof v.id === "string" && Array.isArray(v.issues) && typeof v.status === "string";
@@ -800,10 +801,10 @@ async function stackOf(ctx: PluginContext, run: Run | null): Promise<Stack | nul
 	return run?.stack ? getStack(ctx, run.stack) : null;
 }
 
-/** The unfinished stack one of whose layers is this pull request. */
+/** The stack one of whose layers is this pull request (finished stacks included: a late `closed` webhook may still have a layer to announce). */
 async function stackWithPull(ctx: PluginContext, pr: number): Promise<Stack | null> {
 	for (const s of await listStacks(ctx, 30)) {
-		if (s.status !== "merged" && Object.values(s.prs).includes(pr)) return s;
+		if (Object.values(s.prs).includes(pr)) return s;
 	}
 	return null;
 }
@@ -1081,17 +1082,18 @@ async function applyStackMerge(
 	const top = prs[prs.length - 1];
 	if (m.status === "merged") return completeStackMerge(ctx, settings, conn, stack, layers, prs, m.sha);
 	if (m.status === "failed") return refuseStackMerge(ctx, conn, stack, layers, top, m.message);
-	for (let i = 0; i < MERGE_POLLS && m.uuid && m.status === "pending"; i++) {
-		await sleep(2000);
-		const r = await asyncMergeResult(ctx, conn, top, m.uuid);
-		if (r.status === "merged") return completeStackMerge(ctx, settings, conn, stack, layers, prs, r.sha);
-		if (r.status === "failed") return refuseStackMerge(ctx, conn, stack, layers, top, r.message);
-		if (r.status === "enqueued") break;
+	let polls = 0;
+	let last: AsyncMerge = m;
+	for (; polls < MERGE_POLLS && m.uuid && last.status === "pending"; polls++) {
+		await sleep(MERGE_POLL_MS);
+		last = await asyncMergeResult(ctx, conn, top, m.uuid);
+		if (last.status === "merged") return completeStackMerge(ctx, settings, conn, stack, layers, prs, last.sha);
+		if (last.status === "failed") return refuseStackMerge(ctx, conn, stack, layers, top, last.message);
 	}
 	return putStack(ctx, {
 		...stack,
-		merging: { pr: top, uuid: m.uuid ?? "", prs, startedAt: now() },
-		summary: `merging ${prs.map((p) => `#${p}`).join(", ")} — GitHub is working on it`,
+		merging: { pr: top, uuid: m.uuid ?? "", prs, startedAt: now(), last: { status: last.status, message: last.message, polls } },
+		summary: `merging ${prs.map((p) => `#${p}`).join(", ")} — GitHub is working on it (${last.status})`,
 	});
 }
 
@@ -1127,7 +1129,12 @@ async function completeStackMerge(
 	prs: number[],
 	sha: string | undefined,
 ): Promise<Stack> {
-	for (const pr of prs) {
+	// Whatever brought us here (our merge, a `closed` webhook for one layer),
+	// every layer GitHub shows merged and we have not announced is announced now
+	// — an atomic stack merge closes several PRs at once, and their webhooks
+	// arrive in any order.
+	const toAnnounce = [...new Set([...prs, ...layers.filter((l) => l.state === "merged").map((l) => l.pr)])];
+	for (const pr of toAnnounce) {
 		const b = await getBuild(ctx, pr);
 		if (b?.announced) continue;
 		if (b) await putBuild(ctx, { ...b, status: "merged", announced: true, summary: `merged into ${conn.branch} with the stack${sha ? ` @ ${sha.slice(0, 7)}` : ""}` });
@@ -1140,7 +1147,7 @@ async function completeStackMerge(
 		const issue = stack.issues.find((n) => prOf(stack, n) === pr);
 		if (issue) await closeIssue(ctx, conn, issue).catch((e) => ctx.log.warn(`issue #${issue} not closed`, e));
 	}
-	ctx.log.info(`stack ${stack.id}: merged ${prs.map((p) => `#${p}`).join(", ")} into ${conn.branch}`, { sha });
+	ctx.log.info(`stack ${stack.id}: merged ${toAnnounce.map((p) => `#${p}`).join(", ")} into ${conn.branch}`, { sha });
 	const above = layers.filter((l) => l.state === "open" && !prs.includes(l.pr));
 	const pendingRebuild = { ...(stack.pendingRebuild ?? {}) };
 	for (const l of above) pendingRebuild[String(l.pr)] = { sha: l.build?.headSha ?? l.headSha, since: now() };

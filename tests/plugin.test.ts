@@ -460,7 +460,7 @@ function fakeGitHub(init: { issues?: Record<number, ReturnType<typeof issue>>; p
 		subIssues: init.subIssues ?? {},
 		stacks: [] as Array<{ number: number; open: boolean; base: { ref: string }; pull_requests: Array<{ number: number; state: string; draft: boolean; merged_at: string | null; head: { ref: string; sha: string } }> }>,
 		merges: [] as Array<{ pr: number; body: Record<string, unknown> }>,
-		asyncMerge: false,
+		asyncMerge: false as boolean | "enqueued",
 		runs: [] as Array<Record<string, unknown>>,
 		ci: [] as Array<Record<string, unknown>>,
 		closed: [] as number[],
@@ -510,11 +510,17 @@ function fakeGitHub(init: { issues?: Record<number, ReturnType<typeof issue>>; p
 		}
 		if ((m = path.match(/\/pulls\/(\d+)\/merge-async$/)) && method === "PUT") {
 			state.merges.push({ pr: +m[1], body });
+			if (state.asyncMerge === "enqueued") {
+				// GitHub lands the stack, but the result endpoint never says so (the `closed` webhooks are how we hear of it).
+				markMerged(+m[1]);
+				return Response.json({ status: "pending", uuid: `u${m[1]}` }, { status: 202 });
+			}
 			if (state.asyncMerge) return Response.json({ status: "pending", uuid: `u${m[1]}` }, { status: 202 });
 			markMerged(+m[1]);
 			return Response.json({ status: "merged", details: { sha: "mmmmmmm" } });
 		}
 		if ((m = path.match(/\/pulls\/(\d+)\/merge-async\/(.+)$/))) {
+			if (state.asyncMerge === "enqueued") return Response.json({ status: "enqueued" });
 			markMerged(+m[1]);
 			return Response.json({ status: "merged", details: { sha: "mmmmmmm" } });
 		}
@@ -662,6 +668,33 @@ describe("/agent-stack", () => {
 		expect(commentsPosted(w.calls, 20).filter((b) => b.startsWith("/merged"))).toHaveLength(1);
 		expect(gh2.state.closed).toEqual([5]);
 		expect(w.builds.get("20")).toMatchObject({ status: "merged", announced: true });
+	});
+
+	it("when only GitHub's closed webhooks report the landing, one webhook announces every merged layer — and a late one finds nothing left to do", async () => {
+		const gh = fakeGitHub({ issues: { 1: issue(1, "alice"), 2: issue(2, "alice") }, pulls: { 10: spull(10, "b1"), 11: spull(11, "b2", "b1") } });
+		gh.state.stacks.push({ number: 70, open: true, base: { ref: "main" }, pull_requests: [10, 11].map((n) => ({ number: n, state: "open", draft: false, merged_at: null, head: gh.state.pulls[n].head })) });
+		gh.state.asyncMerge = "enqueued";
+		const { ctx, store, builds, stacks, calls } = ctxWith({ github: conn, settings, fetch: gh.fetch });
+		stacks.set("s1-t", { id: "s1-t", issues: [1, 2], prs: { "1": 10, "2": 11 }, github: 70, status: "running", createdBy: "alice", createdAt: "2026-01-01T00:00:00Z", updatedAt: "2026-01-01T00:00:00Z" });
+		for (const [n, pr] of [[1, 10], [2, 11]] as const) {
+			store.set(String(n), { number: n, title: `Issue ${n}`, author: "alice", status: "completed", prUrl: `https://github.com/acme/site/pull/${pr}`, attempt: 1, stack: "s1-t", layer: n, updatedAt: "2026-01-01T00:00:00Z" });
+		}
+		builds.set("10", { pr: 10, title: "PR 10", author: "alice", headRef: "b1", headSha: "abc1234", staticBranch: "static/b1", attempt: 1, status: "passed", issue: 1, stack: "s1-t", updatedAt: "2026-01-01T00:00:00Z" });
+		builds.set("11", { pr: 11, title: "PR 11", author: "alice", headRef: "b2", headSha: "abc1234", staticBranch: "static/b2", attempt: 1, status: "running", issue: 2, stack: "s1-t", updatedAt: "2026-01-01T00:00:00Z" });
+		await route("ci-callback")(await signed({ ...ciResult(11, 1, true), branch: "b2" }, canonicalCi), ctx);
+		expect(gh.state.merges.map((m) => m.pr)).toEqual([11]);
+		expect(stacks.get("s1-t")).toMatchObject({ status: "running", merging: { pr: 11, prs: [10, 11], last: { status: "enqueued" } } });
+		expect(commentsPosted(calls, 10).filter((b) => b.startsWith("/merged"))).toHaveLength(0);
+		// The first closed webhook (for the bottom layer) announces both merged layers and finishes the stack.
+		await route("webhook")({ input: { action: "closed", pull_request: gh.state.pulls[10], repository: { full_name: "acme/site" } } }, ctx);
+		expect(commentsPosted(calls, 10).filter((b) => b.startsWith("/merged"))).toHaveLength(1);
+		expect(commentsPosted(calls, 11).filter((b) => b.startsWith("/merged"))).toHaveLength(1);
+		expect(stacks.get("s1-t")).toMatchObject({ status: "merged" });
+		expect((stacks.get("s1-t") as { merging?: unknown }).merging).toBeUndefined();
+		// The second one (top layer) arrives after the stack is finished: nothing to add.
+		await route("webhook")({ input: { action: "closed", pull_request: gh.state.pulls[11], repository: { full_name: "acme/site" } } }, ctx);
+		expect(commentsPosted(calls, 11).filter((b) => b.startsWith("/merged"))).toHaveLength(1);
+		expect(gh.state.closed.sort()).toEqual([1, 2]);
 	});
 
 	it("without numbers, stacks the issue's open sub-issues in their order", async () => {

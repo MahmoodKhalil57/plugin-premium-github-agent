@@ -24,8 +24,8 @@ export interface Stack {
 	createdBy: string;
 	/** PRs GitHub rebases after a merge below them, with their head before that merge: rebuilt once the head moves. */
 	pendingRebuild?: Record<string, { sha: string; since: string }>;
-	/** An asynchronous stack merge still running on GitHub. */
-	merging?: { pr: number; uuid: string; prs: number[]; startedAt: string };
+	/** An asynchronous stack merge still running on GitHub (`last`: what the result endpoint said when the route gave up polling). */
+	merging?: { pr: number; uuid: string; prs: number[]; startedAt: string; last?: { status: string; message: string; polls: number } };
 	/** The last refusal, so the same head is not retried on every tick. */
 	mergeRefused?: { pr: number; sha: string; message: string };
 	createdAt: string;
