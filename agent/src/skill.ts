@@ -18,6 +18,9 @@ this is dry coding: read carefully, change little, explain clearly.
 - Restate the problem to yourself in one sentence before touching code.
 
 ## 2. Study the repository before writing anything
+- If the task lists repository skills ("Repository skills available: …"), call
+  \`activate_skill\` for each one that could apply BEFORE reading code — they
+  carry the project's own conventions and override anything generic here.
 - \`get_file_contents\` on the repo root, then follow the structure (\`package.json\`,
   \`README\`, the directories the issue points at).
 - \`search_code\` for the identifiers, error messages or routes the issue mentions.

@@ -86,7 +86,7 @@ export class IssueFixer extends Think<Env> {
 	async getSkills() {
 		const builtin = skills.fromManifest({
 			id: "premium-cms-issue-agent",
-			fingerprint: "fix-github-issue@2",
+			fingerprint: "fix-github-issue@3",
 			skills: [FIX_ISSUE_SKILL],
 		});
 		// The repository's own .agents/skills, captured by the last run().
