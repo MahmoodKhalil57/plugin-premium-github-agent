@@ -10,6 +10,8 @@
 
 import { getSandbox, type Sandbox } from "@cloudflare/sandbox";
 
+import { applyPlan, historyBranches, previousPreviewName, rotationPlan, type RefUpdate } from "./rotation.js";
+
 export interface CiInput {
 	owner: string;
 	repo: string;
@@ -28,6 +30,15 @@ export interface CiInput {
 	callbackUrl: string;
 	/** Host the passing build as a preview Worker (PR builds only). */
 	preview?: boolean;
+	/** Branch builds: keep this many previous deployments as `<staticBranch>-b-N` branches, each hosted as a preview Worker. */
+	previous?: number;
+}
+
+/** An earlier deployment of a branch, kept on its own static branch. */
+export interface PreviousDeployment {
+	branch: string;
+	sha: string;
+	previewUrl: string | null;
 }
 
 export interface StepResult {
@@ -54,6 +65,8 @@ export interface CiResult {
 	previewUrl: string | null;
 	/** `test:preview:cf` run against the live preview (PREVIEW_URL). */
 	previewTest: StepResult | null;
+	/** Branch builds: the deployments before this one, nearest first (`-b-1`, `-b-2`). */
+	previous: PreviousDeployment[];
 	ok: boolean;
 	error?: string;
 }
@@ -111,6 +124,109 @@ export function isCapacityError(message: string | undefined): boolean {
 	return /ContainerUnavailableError|Maximum number of running container/i.test(message ?? "");
 }
 
+const GITHUB_API = "https://api.github.com";
+
+interface RepoAuth {
+	owner: string;
+	repo: string;
+	token: string;
+}
+
+async function github(
+	auth: RepoAuth,
+	method: string,
+	path: string,
+	body?: unknown,
+): Promise<{ status: number; json: Record<string, unknown> | null }> {
+	const r = await fetch(`${GITHUB_API}/repos/${auth.owner}/${auth.repo}${path}`, {
+		method,
+		headers: {
+			Authorization: `Bearer ${auth.token}`,
+			Accept: "application/vnd.github+json",
+			"X-GitHub-Api-Version": "2022-11-28",
+			"User-Agent": "premium-cms-issue-agent/1.0",
+			...(body ? { "Content-Type": "application/json" } : {}),
+		},
+		body: body ? JSON.stringify(body) : undefined,
+	});
+	const json = (await r.json().catch(() => null)) as Record<string, unknown> | null;
+	return { status: r.status, json };
+}
+
+async function refSha(auth: RepoAuth, branch: string): Promise<string | null> {
+	const r = await github(auth, "GET", `/git/ref/heads/${branch}`);
+	if (r.status === 404) return null;
+	const sha = (r.json?.object as { sha?: string } | undefined)?.sha;
+	if (r.status !== 200 || !sha) throw new Error(`GitHub ${r.status} reading ${branch}`);
+	return sha;
+}
+
+/** Point a branch at a commit (created when missing); refs only, no checkout. */
+async function setRef(auth: RepoAuth, u: RefUpdate): Promise<void> {
+	const r = await github(auth, "PATCH", `/git/refs/heads/${u.branch}`, { sha: u.sha, force: true });
+	if (r.status === 200) return;
+	if (r.status === 404 || r.status === 422) {
+		const c = await github(auth, "POST", "/git/refs", { ref: `refs/heads/${u.branch}`, sha: u.sha });
+		if (c.status === 201) return;
+		throw new Error(`GitHub ${c.status} creating ${u.branch}: ${String(c.json?.message ?? "")}`);
+	}
+	throw new Error(`GitHub ${r.status} updating ${u.branch}: ${String(r.json?.message ?? "")}`);
+}
+
+/**
+ * Host every previous deployment as its own assets-only Worker
+ * (`preview-<repo>-<branch>-b-N`), straight from the branch that holds it.
+ * Best-effort per slot: a failed slot keeps `previewUrl: null`.
+ */
+async function deployPrevious(
+	sb: Sandbox,
+	input: CiInput,
+	host: PreviewHost,
+	previous: PreviousDeployment[],
+	gitEnv: Record<string, string>,
+	repoUrl: string,
+): Promise<StepResult> {
+	const t0 = Date.now();
+	const logs: string[] = [];
+	let ok = true;
+	for (const [i, p] of previous.entries()) {
+		const dir = `/workspace/previous-${i + 1}`;
+		const name = previousPreviewName(input.owner, input.repo, input.headRef, i + 1);
+		const clone = await step(
+			sb,
+			`rm -rf ${dir} && git clone -q --depth 1 --branch "${p.branch}" "${repoUrl}" ${dir} && rm -rf ${dir}/.git`,
+			{ cwd: "/workspace", env: gitEnv, timeout: 5 * 60_000 },
+		);
+		if (!clone.ok) {
+			ok = false;
+			logs.push(`${p.branch}: clone failed\n${clone.log}`);
+			continue;
+		}
+		await sb.writeFile(
+			`${dir}/wrangler.preview.jsonc`,
+			JSON.stringify({ name, compatibility_date: "2026-08-01", assets: { directory: "./" }, workers_dev: true }),
+		);
+		const deploy = await step(
+			sb,
+			"npx --yes wrangler@4 deploy --config wrangler.preview.jsonc 2>&1 | grep -viE 'api token|account id'",
+			{
+				cwd: dir,
+				env: { CLOUDFLARE_API_TOKEN: host.apiToken, CLOUDFLARE_ACCOUNT_ID: host.accountId, WRANGLER_SEND_METRICS: "false" },
+				timeout: 10 * 60_000,
+			},
+		);
+		const url = deploy.log.match(/https:\/\/[a-z0-9.-]+\.workers\.dev/)?.[0] ?? null;
+		if (!deploy.ok || !url) {
+			ok = false;
+			logs.push(`${p.branch}: deploy failed\n${deploy.log}`);
+			continue;
+		}
+		p.previewUrl = url;
+		logs.push(`${p.branch} @ ${p.sha.slice(0, 7)} → ${url} (${clone.seconds + deploy.seconds}s)`);
+	}
+	return { ok, log: tail(logs.join("\n")), seconds: Math.round((Date.now() - t0) / 1000) };
+}
+
 /** Stage names reported while a run progresses (each maps to a PR comment command). */
 export type CiStage = "check" | "test" | "preview" | "previewTest";
 export type StageReporter = (stage: CiStage, result: StepResult, extra?: { previewUrl?: string }) => Promise<void>;
@@ -135,6 +251,7 @@ export async function runCi(
 		preview: null,
 		previewUrl: null,
 		previewTest: null,
+		previous: [],
 		ok: false,
 	};
 	const sb = getSandbox(ns, `${input.owner}/${input.repo}#${input.pr || input.headRef}`.toLowerCase(), { sleepAfter: "2m" });
@@ -204,6 +321,26 @@ export async function runCi(
 			return out;
 		}
 
+		// Branch builds keep their previous deployments: shift `static/x` →
+		// `static/x-b-1` → `static/x-b-2` (refs only) before the new build takes
+		// the live slot. A retried build whose push never landed does not rotate again.
+		const keep = input.pr === 0 ? Math.max(0, Math.min(5, Math.floor(input.previous ?? 0))) : 0;
+		const names = historyBranches(input.staticBranch, keep);
+		let history: Array<string | null> = [];
+		if (keep > 0) {
+			try {
+				const shas = await Promise.all(names.map((b) => refSha(input, b)));
+				const plan = rotationPlan(names, shas);
+				for (const u of plan) await setRef(input, u);
+				history = applyPlan(names, shas, plan);
+			} catch (e) {
+				out.push = { ok: false, log: `rotating previous deployments failed: ${String(e)}`, seconds: 0 };
+				out.error = "static push failed";
+				await report("check", out.push);
+				return out;
+			}
+		}
+
 		// dist/ → the static branch: a single-commit history, force-pushed, so the
 		// branch always holds exactly the latest build of the PR head.
 		out.push = await step(
@@ -222,6 +359,11 @@ export async function runCi(
 			return out;
 		}
 		out.staticSha = out.push.log.match(/^[0-9a-f]{40}$/m)?.[0] ?? null;
+		out.previous = names.slice(1).flatMap((branch, i) => {
+			const sha = history[i + 1];
+			return sha ? [{ branch, sha, previewUrl: null }] : [];
+		});
+		if (host && out.previous.length) out.preview = await deployPrevious(sb, input, host, out.previous, gitEnv, repoUrl);
 		await report("check", {
 			ok: true,
 			log: `check:cf ${out.check.seconds}s · build ${out.build.seconds}s · ${input.staticBranch} @ ${out.staticSha?.slice(0, 7) ?? "?"}`,

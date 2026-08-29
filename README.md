@@ -37,6 +37,21 @@ human's PR are informational; `/…-succeeded` never triggers anything. Pushes
 to the default branch and content publishes rebuild `static/<default>` without
 any comment.
 
+## Default branch: live, one back, two back
+
+Every successful build of the default branch is a deployment. Before the new
+`dist/` is pushed to `static/<default>` (what GitHub Pages serves), the worker
+shifts the earlier deployments one slot back — `static/<default>-b-1` ← the
+build that was live, `static/<default>-b-2` ← the one before it — by moving
+refs through the GitHub API (no checkout, nothing rebuilt). Each kept slot is
+then hosted as its own assets-only Worker,
+`preview-<owner>-<repo>-<default>-b-1` / `-b-2` on `workers.dev`, straight
+from its branch, so there are always three things to look at: the live site,
+the previous deployment and the one before that. The slot branches and their
+preview URLs are on the site row in the admin page (and in the `site/build`
+route's `build.previous`). A build whose push never landed does not rotate
+again, so a retry cannot push the older snapshots out.
+
 GitHub → App webhook → parent control plane (`githubWebhook`, routed by
 repository) → this plugin's `webhook` route; issues and PRs are re-read from
 GitHub before anything happens. The App must subscribe to **Issues**,

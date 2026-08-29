@@ -19,7 +19,13 @@
  *             GitHub MCP). It reads the repo, writes a branch, opens a PR and
  *             leaves it open, then calls back (`agent-callback`, HMAC-signed).
  *             No code is ever executed — dry coding only.
- *   storage   `runs` — one row per issue the agent was asked about.
+ *   site      pushes to the default branch and content publishes rebuild
+ *             `static/<branch>` (what GitHub Pages serves). The two previous
+ *             deployments stay on `static/<branch>-b-1` / `-b-2`, each hosted
+ *             as its own preview Worker, so "live", one back and two back are
+ *             always there.
+ *   storage   `runs` — one row per issue the agent was asked about;
+ *             `builds` — one row per PR / built branch.
  *   admin     /github-agent page: issues, runs, "new issue", settings.
  */
 
@@ -41,6 +47,7 @@ import {
 	type Callback,
 	type CiResult,
 	type CiStageReport,
+	type PreviousDeployment,
 	type Run,
 } from "./agent.js";
 import {
@@ -91,6 +98,8 @@ function commandsIn(body: string): Command[] {
 	return out;
 }
 const STATUS_CONTEXT = "premium-cms/ci";
+/** Deployments of the default branch kept behind the live one (`static/<branch>-b-1` … `-b-N`). */
+const PREVIOUS_DEPLOYMENTS = 2;
 /** A build still "running" after this long lost its callback; a new one may start. */
 const STALE_BUILD_MS = 30 * 60 * 1000;
 
@@ -288,6 +297,8 @@ interface Build {
 	issue?: number;
 	/** Branch builds: another build was requested while this one ran. */
 	rebuild?: boolean;
+	/** Branch builds: the deployments before the live one (`-b-1`, `-b-2`) and their preview Workers. */
+	previous?: PreviousDeployment[];
 	updatedAt: string;
 }
 
@@ -557,6 +568,7 @@ async function buildDefaultBranch(
 		staticSha: existing?.staticSha,
 		attempt: (existing?.attempt ?? 0) + 1,
 		status: "running",
+		previous: existing?.previous,
 		updatedAt: now(),
 	};
 	await putBuild(ctx, build);
@@ -571,6 +583,7 @@ async function buildDefaultBranch(
 			siteUrl: ctx.site.url,
 			callbackUrl: ciCallbackUrl(ctx),
 			preview: false,
+			previous: PREVIOUS_DEPLOYMENTS,
 		});
 		return { started: true };
 	} catch (error) {
@@ -588,6 +601,7 @@ async function recordBranchCi(ctx: PluginContext, settings: Settings, conn: Conn
 		...build,
 		status: r.ok ? "passed" : "failed",
 		staticSha: r.staticSha ?? build.staticSha,
+		previous: r.previous?.length ? r.previous : build.previous,
 		summary: r.ok ? `published to ${r.staticBranch}` : (firstFailure(r)?.name ?? r.error ?? "failed"),
 		rebuild: false,
 	};
@@ -1101,6 +1115,14 @@ async function buildPage(ctx: PluginContext, notice?: string) {
 			text: site
 				? `Site (${conn.branch}): ${site.status}${site.summary ? ` — ${site.summary}` : ""}${site.staticSha ? ` @ ${site.staticSha.slice(0, 7)}` : ""}${pagesUrl ? ` · served by GitHub Pages from ${site.staticBranch} (${pagesUrl})` : ""}`
 				: `Site (${conn.branch}): not built by the platform yet — pushes to ${conn.branch} and content publishes build it to ${staticBranchFor(conn.branch)}.`,
+		});
+		blocks.push({
+			type: "context",
+			text: site?.previous?.length
+				? `Previous deployments: ${site.previous
+						.map((p, i) => `${i + 1} back — ${p.branch} @ ${p.sha.slice(0, 7)}${p.previewUrl ? ` → ${p.previewUrl}` : " (no preview)"}`)
+						.join(" · ")}`
+				: `Previous deployments: none kept yet — each build keeps the last ${PREVIOUS_DEPLOYMENTS} on ${staticBranchFor(conn.branch)}-b-1 … -b-${PREVIOUS_DEPLOYMENTS}, each with its own preview URL.`,
 		});
 		blocks.push({
 			type: "actions",

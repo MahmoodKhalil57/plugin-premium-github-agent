@@ -423,6 +423,7 @@ export default {
 				siteUrl: body.siteUrl!,
 				callbackUrl: body.callbackUrl!,
 				preview: body.preview !== false,
+				previous: typeof body.previous === "number" ? body.previous : 0,
 			};
 			const key = input.pr > 0 ? nameFor(input.owner, input.repo, input.pr) : `${input.owner}/${input.repo}@${input.headRef}`.toLowerCase();
 			const agent = await getAgentByName(env.IssueFixer, `ci:${key}`);

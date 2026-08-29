@@ -69,7 +69,7 @@ function commentEvent(n: number, author: string, body: string, onPull = false) {
 }
 function ciResult(pr: number, attempt: number, ok: boolean) {
 	const step = (k: boolean) => ({ ok: k, log: k ? "fine" : "boom", seconds: 1 });
-	return { pr, branch: "agent/issue-1-x", attempt, headSha: "abc1234", staticBranch: "static/agent/issue-1-x", staticSha: ok ? "def5678" : null, check: step(true), build: step(ok), push: ok ? step(true) : null, test: ok ? step(true) : null, preview: ok ? step(true) : null, previewUrl: ok ? `https://preview-acme-site-pr${pr}.example.workers.dev` : null, previewTest: ok ? step(true) : null, ok, ...(ok ? {} : { error: "build failed" }) };
+	return { pr, branch: "agent/issue-1-x", attempt, headSha: "abc1234", staticBranch: "static/agent/issue-1-x", staticSha: ok ? "def5678" : null, check: step(true), build: step(ok), push: ok ? step(true) : null, test: ok ? step(true) : null, preview: ok ? step(true) : null, previewUrl: ok ? `https://preview-acme-site-pr${pr}.example.workers.dev` : null, previewTest: ok ? step(true) : null, previous: [], ok, ...(ok ? {} : { error: "build failed" }) };
 }
 async function signed(cb: Record<string, unknown>, canonical: (x: never) => string, key = "k") {
 	const sig = await hmacHex(key, canonical(cb as never));
@@ -281,10 +281,15 @@ describe("/awaiting-test and the runner's reports", () => {
 });
 
 describe("default branch", () => {
-	function branchResult(attempt: number, ok: boolean) {
+	type Previous = Array<{ branch: string; sha: string; previewUrl: string | null }>;
+	function branchResult(attempt: number, ok: boolean, previous: Previous = []) {
 		const step = (k: boolean) => ({ ok: k, log: k ? "fine" : "boom", seconds: 1 });
-		return { pr: 0, branch: "main", attempt, headSha: "mainsha", staticBranch: "static/main", staticSha: ok ? "stat123" : null, check: step(true), build: step(ok), push: ok ? step(true) : null, test: ok ? step(true) : null, preview: null, previewUrl: null, previewTest: null, ok, ...(ok ? {} : { error: "build failed" }) };
+		return { pr: 0, branch: "main", attempt, headSha: "mainsha", staticBranch: "static/main", staticSha: ok ? "stat123" : null, check: step(true), build: step(ok), push: ok ? step(true) : null, test: ok ? step(true) : null, preview: null, previewUrl: null, previewTest: null, previous, ok, ...(ok ? {} : { error: "build failed" }) };
 	}
+	const previous: Previous = [
+		{ branch: "static/main-b-1", sha: "prev1sha", previewUrl: "https://preview-acme-site-main-b-1.example.workers.dev" },
+		{ branch: "static/main-b-2", sha: "prev2sha", previewUrl: "https://preview-acme-site-main-b-2.example.workers.dev" },
+	];
 
 	it("builds main on push, then switches Pages to static/main when it passes", async () => {
 		const pagesCalls: Array<{ method?: string; body: unknown }> = [];
@@ -305,10 +310,36 @@ describe("default branch", () => {
 		const r = (await route("webhook")({ input: { ref: "refs/heads/main", after: "mainsha", repository: { full_name: "acme/site" } } }, ctx)) as { started: boolean };
 		expect(r.started).toBe(true);
 		const ci = JSON.parse(String(calls.find((c) => c.url.endsWith("/ci"))?.init?.body));
-		expect(ci).toMatchObject({ pr: 0, headRef: "main", staticBranch: "static/main", preview: false });
+		expect(ci).toMatchObject({ pr: 0, headRef: "main", staticBranch: "static/main", preview: false, previous: 2 });
 		await route("ci-callback")(await signed(branchResult(1, true), canonicalCi), ctx);
 		expect(builds.get("branch:main")).toMatchObject({ status: "passed", staticSha: "stat123" });
 		expect(pagesCalls).toEqual([{ method: "PUT", body: { build_type: "legacy", source: { branch: "static/main", path: "/" } } }]);
+	});
+
+	it("keeps the two previous deployments and their preview URLs on the site row, and shows them in the admin", async () => {
+		const { ctx, builds } = ctxWith({
+			github: conn,
+			settings,
+			fetch: async (url, init) => {
+				if (url.endsWith("/branches/main")) return Response.json({ commit: { sha: "mainsha" } });
+				if (url.endsWith("/ci")) return Response.json({ accepted: true }, { status: 202 });
+				if (url.endsWith("/pages") && (init?.method ?? "GET") === "GET") return Response.json({ build_type: "legacy", source: { branch: "static/main", path: "/" }, html_url: "https://acme.github.io/site/" });
+				return Response.json({});
+			},
+		});
+		await route("site/build")({ input: {} }, ctx);
+		await route("ci-callback")(await signed(branchResult(1, true, previous), canonicalCi), ctx);
+		expect(builds.get("branch:main")).toMatchObject({ status: "passed", previous });
+
+		// A later build that reports no slots keeps what it had.
+		await route("site/build")({ input: {} }, ctx);
+		await route("ci-callback")(await signed(branchResult(2, false), canonicalCi), ctx);
+		expect(builds.get("branch:main")).toMatchObject({ status: "failed", previous });
+
+		const page = (await route("admin")({ input: { type: "page_load", page: "/github-agent" } }, ctx)) as { blocks: Array<{ type: string; text?: string }> };
+		const line = page.blocks.find((b) => b.type === "context" && b.text?.startsWith("Previous deployments:"))?.text ?? "";
+		expect(line).toContain("1 back — static/main-b-1 @ prev1sh → https://preview-acme-site-main-b-1.example.workers.dev");
+		expect(line).toContain("2 back — static/main-b-2 @ prev2sh → https://preview-acme-site-main-b-2.example.workers.dev");
 	});
 
 	it("ignores pushes to other branches and to static/*", async () => {

@@ -71,6 +71,13 @@ export interface CiStep {
 	seconds: number;
 }
 
+/** An earlier deployment of the default branch, kept on `static/<branch>-b-N` and hosted as a preview Worker. */
+export interface PreviousDeployment {
+	branch: string;
+	sha: string;
+	previewUrl: string | null;
+}
+
 /** What the agent worker POSTs to `ci-callback` (and returns from `/ci`). */
 export interface CiResult {
 	pr: number;
@@ -87,6 +94,8 @@ export interface CiResult {
 	preview: CiStep | null;
 	previewUrl: string | null;
 	previewTest: CiStep | null;
+	/** Branch builds: the deployments before this one, nearest first. */
+	previous?: PreviousDeployment[];
 	ok: boolean;
 	error?: string;
 }
@@ -107,6 +116,7 @@ export function canonicalCi(r: CiResult): string {
 		preview: r.preview ?? null,
 		previewUrl: r.previewUrl ?? null,
 		previewTest: r.previewTest ?? null,
+		...(r.previous !== undefined ? { previous: r.previous } : {}),
 		ok: r.ok,
 		...(r.error !== undefined ? { error: r.error } : {}),
 	});
@@ -162,6 +172,8 @@ export async function dispatchCi(
 		siteUrl: string;
 		callbackUrl: string;
 		preview?: boolean;
+		/** Branch builds: how many previous deployments to keep (`static/<branch>-b-N`). */
+		previous?: number;
 	},
 ): Promise<void> {
 	const r = await call(ctx, settings, "POST", "/ci", {
