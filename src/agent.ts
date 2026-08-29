@@ -65,6 +65,73 @@ async function call(
 	return { ok: res.ok, status: res.status, json };
 }
 
+export interface CiStep {
+	ok: boolean;
+	log: string;
+	seconds: number;
+}
+
+/** What the agent worker POSTs to `ci-callback` (and returns from `/ci`). */
+export interface CiResult {
+	pr: number;
+	attempt: number;
+	headSha: string;
+	staticBranch: string;
+	staticSha: string | null;
+	check: CiStep | null;
+	build: CiStep | null;
+	push: CiStep | null;
+	test: CiStep | null;
+	ok: boolean;
+	error?: string;
+}
+
+/** Fixed field order: what the worker signs (JSON of the whole result). */
+export function canonicalCi(r: CiResult): string {
+	return JSON.stringify({
+		pr: r.pr,
+		attempt: r.attempt,
+		headSha: r.headSha,
+		staticBranch: r.staticBranch,
+		staticSha: r.staticSha,
+		check: r.check,
+		build: r.build,
+		push: r.push,
+		test: r.test,
+		ok: r.ok,
+		...(r.error !== undefined ? { error: r.error } : {}),
+	});
+}
+
+/** Start a PR build; the worker runs it to completion and calls back. */
+export async function dispatchCi(
+	ctx: PluginContext,
+	settings: Settings,
+	conn: Connection,
+	input: {
+		pr: number;
+		headRef: string;
+		headSha: string;
+		attempt: number;
+		staticBranch: string;
+		backendUrl: string;
+		siteUrl: string;
+		callbackUrl: string;
+	},
+): Promise<CiResult> {
+	const r = await call(ctx, settings, "POST", "/ci", {
+		owner: conn.owner,
+		repo: conn.repo,
+		token: conn.token,
+		previewSecret: conn.previewSecret,
+		...input,
+	});
+	if (!r.ok || typeof r.json.pr !== "number") {
+		throw new Error(`agent ${r.status}: ${String(r.json.error ?? "ci failed to start")}`);
+	}
+	return r.json as unknown as CiResult;
+}
+
 export async function dispatch(
 	ctx: PluginContext,
 	settings: Settings,
@@ -72,6 +139,7 @@ export async function dispatch(
 	issue: number,
 	attempt: number,
 	callbackUrl: string,
+	note?: string,
 ): Promise<{ submissionId: string; accepted: boolean }> {
 	const r = await call(ctx, settings, "POST", "/run", {
 		owner: conn.owner,
@@ -83,6 +151,7 @@ export async function dispatch(
 		reasoning: settings.reasoning,
 		attempt,
 		callbackUrl,
+		...(note ? { note } : {}),
 	});
 	if (!r.ok || typeof r.json.submissionId !== "string") {
 		throw new Error(`agent ${r.status}: ${String(r.json.error ?? "no submission id")}`);

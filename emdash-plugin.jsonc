@@ -19,6 +19,7 @@
 	"allowedHosts": ["api.github.com", "*.workers.dev", "*.premium-cms.com"],
 	"storage": {
 		"runs": { "indexes": ["status", "updatedAt", "number"] },
+		"builds": { "indexes": ["status", "updatedAt", "pr"] },
 	},
 
 	"admin": {

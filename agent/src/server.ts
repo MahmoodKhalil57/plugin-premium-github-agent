@@ -13,11 +13,17 @@ import { Think } from "@cloudflare/think";
 import { getAgentByName } from "agents";
 import { skills } from "@cloudflare/think";
 
+import { Sandbox } from "@cloudflare/sandbox";
+
+import { runCi, type CiInput } from "./ci.js";
 import { FIX_ISSUE_SKILL } from "./skill.js";
+
+export { Sandbox };
 
 interface Env {
 	AI: Ai;
 	IssueFixer: DurableObjectNamespace<IssueFixer>;
+	Sandbox: DurableObjectNamespace<Sandbox>;
 	/** Shared secret the plugin sends as `Authorization: Bearer …`. */
 	AGENT_KEY: string;
 	/** Default model; `run` may override per request. */
@@ -42,6 +48,8 @@ export interface RunInput {
 	attempt?: number;
 	/** Where to POST the outcome (signed with AGENT_KEY) when the run ends. */
 	callbackUrl?: string;
+	/** Extra context for this attempt, e.g. the failing CI log. */
+	note?: string;
 }
 
 interface Watch {
@@ -127,6 +135,7 @@ export class IssueFixer extends Think<Env> {
 			attempt > 1
 				? `This is attempt ${attempt}. Re-read the issue and the repository state (branches and pull requests you opened earlier may exist — reuse or correct them rather than duplicating). Fix this issue and open or update a pull request. Do not merge it.`
 				: "Fix this issue and open a pull request. Do not merge it.",
+			...(input.note ? ["", input.note] : []),
 		].join("\n");
 
 		const res = await this.submitMessages(
@@ -279,8 +288,46 @@ export default {
 				reasoning: body.reasoning,
 				attempt: typeof body.attempt === "number" ? body.attempt : 1,
 				callbackUrl: typeof body.callbackUrl === "string" ? body.callbackUrl : undefined,
+				note: typeof body.note === "string" ? body.note.slice(0, 12_000) : undefined,
 			});
 			return json(out);
+		}
+
+		// Pull-request CI: runs to completion inside the request (the container
+		// does the work), then also POSTs the signed result to the callback.
+		if (request.method === "POST" && url.pathname === "/ci") {
+			const body = (await request.json().catch(() => null)) as Partial<CiInput> | null;
+			const need = ["owner", "repo", "headRef", "headSha", "staticBranch", "token", "backendUrl", "siteUrl", "callbackUrl"] as const;
+			if (!body || typeof body.pr !== "number" || need.some((k) => typeof body[k] !== "string")) {
+				return json({ error: `pr (number) and ${need.join(", ")} are required` }, 400);
+			}
+			const input: CiInput = {
+				owner: body.owner!,
+				repo: body.repo!,
+				headRef: body.headRef!,
+				headSha: body.headSha!,
+				pr: body.pr,
+				attempt: typeof body.attempt === "number" ? body.attempt : 1,
+				staticBranch: body.staticBranch!,
+				token: body.token!,
+				backendUrl: body.backendUrl!,
+				previewSecret: typeof body.previewSecret === "string" ? body.previewSecret : "",
+				siteUrl: body.siteUrl!,
+				callbackUrl: body.callbackUrl!,
+			};
+			const result = await runCi(env.Sandbox, input);
+			const payload = JSON.stringify(result);
+			const sig = await hmac(env.AGENT_KEY, payload);
+			await fetch(input.callbackUrl, {
+				method: "POST",
+				headers: {
+					"Content-Type": "application/json",
+					"X-Agent-Signature": `sha256=${sig}`,
+					"User-Agent": "premium-cms-issue-agent/1.0",
+				},
+				body: payload,
+			}).catch(() => undefined);
+			return json(result);
 		}
 
 		if (request.method === "GET" && url.pathname === "/status") {

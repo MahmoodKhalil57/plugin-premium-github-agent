@@ -20,13 +20,16 @@ import type { PluginContext, SandboxedPlugin } from "@premium-cms/emdash/plugin"
 
 import {
 	canonicalCallback,
+	canonicalCi,
 	dispatch,
+	dispatchCi,
 	hmacHex,
 	prUrlFrom,
 	runId,
 	status as agentStatus,
 	timingSafeEqual,
 	type Callback,
+	type CiResult,
 	type Run,
 } from "./agent.js";
 import {
@@ -35,13 +38,19 @@ import {
 	createIssue,
 	getConnection,
 	getIssue,
+	getPull,
 	listIssues,
+	setStatus,
 	type Connection,
 	type Issue,
+	type PullRequest,
 } from "./github.js";
 import { DEFAULTS, normalizeLogin, readSettings, saveSettings, type Settings } from "./settings.js";
 
 const CALLBACK_PATH = "/_emdash/api/plugins/premium-github-agent/agent-callback";
+const CI_CALLBACK_PATH = "/_emdash/api/plugins/premium-github-agent/ci-callback";
+const STATUS_CONTEXT = "premium-cms/ci";
+const AGENT_BRANCH = /^agent\/issue-(\d+)-/;
 
 // ── Helpers ──────────────────────────────────────────────────────────────
 
@@ -110,6 +119,7 @@ async function runIssue(
 	conn: Connection,
 	issue: Issue,
 	again = false,
+	note?: string,
 ): Promise<Run> {
 	const existing = await getRun(ctx, issue.number);
 	if (existing && (existing.status === "queued" || existing.status === "running")) return existing;
@@ -128,7 +138,7 @@ async function runIssue(
 		return run;
 	}
 	try {
-		const d = await dispatch(ctx, settings, conn, issue.number, attempt, callbackUrl(ctx));
+		const d = await dispatch(ctx, settings, conn, issue.number, attempt, callbackUrl(ctx), note);
 		const run: Run = { ...base, status: "queued", submissionId: d.submissionId };
 		await putRun(ctx, run);
 		ctx.log.info(`issue #${issue.number} handed to the agent`, { submission: d.submissionId, attempt });
@@ -196,6 +206,227 @@ function issueNumberFromEvent(input: unknown): { action: string; number: number;
 	return { action: String(input.action ?? ""), number, label };
 }
 
+// ── Pull-request builds ──────────────────────────────────────────────────
+
+type BuildStatus = "running" | "passed" | "failed" | "error" | "capped";
+
+/** One row per PR in the `builds` storage: the latest CI attempt and its outcome. */
+interface Build {
+	pr: number;
+	title: string;
+	author: string;
+	headRef: string;
+	headSha: string;
+	staticBranch: string;
+	staticSha?: string;
+	/** CI attempts on this PR (across agent fixes). */
+	attempt: number;
+	status: BuildStatus;
+	summary?: string;
+	/** Issue the PR fixes when the branch is the agent's (`agent/issue-N-…`). */
+	issue?: number;
+	updatedAt: string;
+}
+
+function isBuild(v: unknown): v is Build {
+	return isRecord(v) && typeof v.pr === "number" && typeof v.status === "string";
+}
+
+async function getBuild(ctx: PluginContext, pr: number): Promise<Build | null> {
+	const row = await ctx.storage.builds!.get(String(pr));
+	return isBuild(row) ? row : null;
+}
+
+async function putBuild(ctx: PluginContext, b: Build): Promise<void> {
+	await ctx.storage.builds!.put(String(b.pr), { ...b, updatedAt: now() });
+}
+
+async function listBuilds(ctx: PluginContext, limit = 50): Promise<Build[]> {
+	const r = await ctx.storage.builds!.query({ orderBy: { updatedAt: "desc" }, limit });
+	return r.items.map((i) => i.data).filter(isBuild);
+}
+
+function staticBranchFor(headRef: string): string {
+	return `static/${headRef}`;
+}
+
+function ciCallbackUrl(ctx: PluginContext): string {
+	return `${ctx.site.url.replace(/\/+$/, "")}${CI_CALLBACK_PATH}`;
+}
+
+function stepLine(name: string, s: { ok: boolean; seconds: number } | null): string {
+	if (!s) return `- ${name}: skipped`;
+	return `- ${name}: ${s.ok ? "✅ passed" : "❌ failed"} (${s.seconds}s)`;
+}
+
+function firstFailure(r: CiResult): { name: string; log: string } | null {
+	for (const [name, s] of [["check:cf", r.check], ["build", r.build], ["static push", r.push], ["test:cf", r.test]] as const) {
+		if (s && !s.ok) return { name, log: s.log };
+	}
+	return null;
+}
+
+function ciComment(conn: Connection, b: Build, r: CiResult, next: string): string {
+	const failure = firstFailure(r);
+	const staticUrl = `https://github.com/${conn.owner}/${conn.repo}/tree/${r.staticBranch}`;
+	return [
+		`### ${r.ok ? "✅" : "❌"} PremiumCMS CI — attempt ${r.attempt} on \`${b.headRef}\` @ ${r.headSha.slice(0, 7)}`,
+		"",
+		stepLine("check:cf", r.check),
+		stepLine("build (astro)", r.build),
+		stepLine(`static build → [\`${r.staticBranch}\`](${staticUrl})`, r.push),
+		stepLine("test:cf", r.test),
+		...(r.staticSha ? ["", `Static build commit: ${r.staticSha.slice(0, 7)} (force-pushed; the branch always holds the latest build of this PR).`] : []),
+		...(failure
+			? ["", `<details><summary>${failure.name} output</summary>`, "", "```", failure.log.trim().slice(-5000), "```", "", "</details>"]
+			: []),
+		...(r.error && !failure ? ["", `Error: ${r.error}`] : []),
+		"",
+		next,
+	].join("\n");
+}
+
+/**
+ * Build one PR (opened / new commits). The PR author must be whitelisted; a
+ * PR that already used up `maxBuildAttempts` is left alone.
+ */
+async function buildPull(
+	ctx: PluginContext,
+	settings: Settings,
+	conn: Connection,
+	pr: PullRequest,
+	opts: { force?: boolean } = {},
+): Promise<{ started: boolean; reason?: string; build?: Build }> {
+	if (!allowed(settings, pr.author)) return { started: false, reason: `@${pr.author} is not a whitelisted user` };
+	if (!settings.agentKey) return { started: false, reason: "Agent key is not set in the plugin settings" };
+	if (pr.state !== "open") return { started: false, reason: `PR is ${pr.state}` };
+
+	const existing = await getBuild(ctx, pr.number);
+	if (existing?.status === "running" && existing.headSha === pr.headSha && !opts.force) {
+		return { started: false, reason: "already building this commit", build: existing };
+	}
+	const attempt = (existing?.attempt ?? 0) + 1;
+	if (attempt > settings.maxBuildAttempts && !opts.force) {
+		const capped: Build = { ...(existing as Build), status: "capped", updatedAt: now() };
+		await putBuild(ctx, capped);
+		return { started: false, reason: `reached ${settings.maxBuildAttempts} build attempts`, build: capped };
+	}
+	const issue = Number(pr.headRef.match(AGENT_BRANCH)?.[1]) || existing?.issue;
+	const build: Build = {
+		pr: pr.number,
+		title: pr.title,
+		author: pr.author,
+		headRef: pr.headRef,
+		headSha: pr.headSha,
+		staticBranch: existing?.staticBranch ?? staticBranchFor(pr.headRef),
+		staticSha: existing?.staticSha,
+		attempt,
+		status: "running",
+		issue: Number.isInteger(issue) ? issue : undefined,
+		updatedAt: now(),
+	};
+	await putBuild(ctx, build);
+	await setStatus(ctx, conn, pr.headSha, {
+		state: "pending",
+		context: STATUS_CONTEXT,
+		description: `attempt ${attempt}: check → build → static → test`,
+	}).catch(() => undefined);
+
+	try {
+		// The worker runs the job to completion and also POSTs the signed result
+		// to ci-callback; this direct response is the same payload.
+		const result = await dispatchCi(ctx, settings, conn, {
+			pr: pr.number,
+			headRef: pr.headRef,
+			headSha: pr.headSha,
+			attempt,
+			staticBranch: build.staticBranch,
+			backendUrl: ctx.site.url,
+			siteUrl: ctx.site.url,
+			callbackUrl: ciCallbackUrl(ctx),
+		});
+		const after = await recordCi(ctx, settings, conn, result);
+		return { started: true, build: after ?? build };
+	} catch (error) {
+		const failed: Build = { ...build, status: "error", summary: String(error) };
+		await putBuild(ctx, failed);
+		ctx.log.error(`PR #${pr.number}: ci dispatch failed`, error);
+		return { started: false, reason: String(error), build: failed };
+	}
+}
+
+/**
+ * Apply a CI result: store it, comment on the PR, set the commit status and —
+ * when the PR is the agent's own fix branch and the run failed — ask the
+ * agent to push a fix (which GitHub reports as `synchronize`, re-running CI
+ * onto the same static branch) until `maxBuildAttempts` is used up.
+ * Idempotent per (pr, attempt): the worker's callback and the direct response
+ * carry the same payload.
+ */
+async function recordCi(ctx: PluginContext, settings: Settings, conn: Connection, r: CiResult): Promise<Build | null> {
+	const build = await getBuild(ctx, r.pr);
+	if (!build) return null;
+	if (build.attempt !== r.attempt || build.status !== "running") return build;
+
+	const exhausted = r.attempt >= settings.maxBuildAttempts;
+	const agentPr = build.issue !== undefined;
+	let next: Build = {
+		...build,
+		status: r.ok ? "passed" : "failed",
+		staticSha: r.staticSha ?? build.staticSha,
+		summary: r.ok ? `passed on attempt ${r.attempt}` : (firstFailure(r)?.name ?? r.error ?? "failed"),
+	};
+	let closing: string;
+	if (r.ok) {
+		closing = `Ready for review. The static build of this PR lives on \`${r.staticBranch}\`.`;
+	} else if (agentPr && !exhausted) {
+		closing = `The agent will push a fix to \`${build.headRef}\` (build attempt ${r.attempt + 1} of ${settings.maxBuildAttempts}).`;
+	} else if (agentPr) {
+		closing = `Build attempts exhausted (${settings.maxBuildAttempts}); a human needs to take it from here.`;
+		next = { ...next, status: "capped" };
+	} else {
+		closing = "Push a fix to re-run the checks.";
+	}
+	await putBuild(ctx, next);
+
+	await comment(ctx, conn, r.pr, ciComment(conn, next, r, closing)).catch((e) => ctx.log.warn("PR comment failed", e));
+	await setStatus(ctx, conn, r.headSha, {
+		state: r.ok ? "success" : "failure",
+		context: STATUS_CONTEXT,
+		description: r.ok ? `passed (attempt ${r.attempt}); static: ${r.staticBranch}` : `${next.summary} (attempt ${r.attempt})`,
+		targetUrl: `https://github.com/${conn.owner}/${conn.repo}/pull/${r.pr}`,
+	}).catch(() => undefined);
+
+	if (!r.ok && agentPr && !exhausted && build.issue !== undefined) {
+		const failure = firstFailure(r);
+		const note = [
+			`CI failed on your pull request #${r.pr} (branch \`${build.headRef}\`, commit ${r.headSha.slice(0, 7)}) at step "${failure?.name ?? r.error ?? "unknown"}".`,
+			"Fix the cause and push the corrected files to that same branch (do not open another PR or branch). Then comment on the PR with what you changed.",
+			"",
+			"Output:",
+			"```",
+			(failure?.log ?? r.error ?? "").trim().slice(-6000),
+			"```",
+		].join("\n");
+		const issue = await getIssue(ctx, conn, build.issue);
+		if (issue) {
+			const run = await runIssue(ctx, settings, conn, issue, true, note);
+			ctx.log.info(`PR #${r.pr}: agent asked to fix (attempt ${run.attempt})`);
+		}
+	}
+	return next;
+}
+
+function pullFromEvent(input: unknown): { action: string; number: number; headSha: string; author: string } | null {
+	if (!isRecord(input) || !isRecord(input.pull_request)) return null;
+	const pr = input.pull_request;
+	const number = Number(pr.number);
+	if (!Number.isInteger(number) || number <= 0) return null;
+	const head = isRecord(pr.head) ? pr.head : {};
+	const user = isRecord(pr.user) ? pr.user : {};
+	return { action: String(input.action ?? ""), number, headSha: String(head.sha ?? ""), author: String(user.login ?? "") };
+}
+
 // ── Plugin ───────────────────────────────────────────────────────────────
 
 const plugin: SandboxedPlugin = {
@@ -217,6 +448,20 @@ const plugin: SandboxedPlugin = {
 		 */
 		webhook: {
 			handler: async (routeCtx, ctx) => {
+				const pull = pullFromEvent(routeCtx.input);
+				if (pull) {
+					if (!["opened", "synchronize", "reopened", "ready_for_review"].includes(pull.action)) {
+						return { success: true, ignored: `action ${pull.action}` };
+					}
+					const setup = await requireSetup(ctx);
+					if (!setup.ok) return { success: false, error: setup.error };
+					if (!setup.settings.enabled) return { success: true, ignored: "disabled" };
+					const pr = await getPull(ctx, setup.conn, pull.number);
+					if (!pr) return { success: true, ignored: "pull request not found" };
+					if (pr.draft) return { success: true, ignored: "draft" };
+					const r = await buildPull(ctx, setup.settings, setup.conn, pr);
+					return { success: true, pr: pr.number, started: r.started, reason: r.reason, status: r.build?.status };
+				}
 				const ev = issueNumberFromEvent(routeCtx.input);
 				if (!ev) return { success: true, ignored: "not an issue event" };
 				if (!["opened", "labeled", "reopened"].includes(ev.action)) {
@@ -263,6 +508,44 @@ const plugin: SandboxedPlugin = {
 				if (cb.prUrl && !next.prUrl) next.prUrl = cb.prUrl;
 				await putRun(ctx, next);
 				return { success: true, status: next.status };
+			},
+		},
+
+		/** The agent worker's signed CI result for a pull request (same payload as its direct response). */
+		"ci-callback": {
+			public: true,
+			handler: async (routeCtx, ctx) => {
+				const input = isRecord(routeCtx.input) ? routeCtx.input : {};
+				const settings = await readSettings(ctx);
+				const given = headerOf(routeCtx.request, "X-Agent-Signature").replace(/^sha256=/, "");
+				if (!settings.agentKey || !given) return { success: false, error: "unsigned" };
+				const r = input as unknown as CiResult;
+				const expected = await hmacHex(settings.agentKey, canonicalCi(r));
+				if (!timingSafeEqual(given, expected)) return { success: false, error: "bad signature" };
+				const conn = await getConnection(ctx);
+				if (!conn) return { success: false, error: "GitHub not connected" };
+				const build = await recordCi(ctx, settings, conn, r);
+				return { success: true, status: build?.status ?? "unknown" };
+			},
+		},
+
+		/** Pull requests the plugin has built, newest first. */
+		pulls: {
+			handler: async (_routeCtx, ctx) => ({ success: true, items: await listBuilds(ctx, 50) }),
+		},
+
+		/** Build one PR now (whitelist applies; `force: true` ignores the attempt cap). */
+		"pulls/build": {
+			handler: async (routeCtx, ctx) => {
+				const setup = await requireSetup(ctx);
+				if (!setup.ok) return { success: false, error: setup.error };
+				const input = isRecord(routeCtx.input) ? routeCtx.input : {};
+				const number = Number(input.number);
+				if (!Number.isInteger(number) || number <= 0) return { success: false, error: "PR number required." };
+				const pr = await getPull(ctx, setup.conn, number);
+				if (!pr) return { success: false, error: `PR #${number} not found.` };
+				const r = await buildPull(ctx, setup.settings, setup.conn, pr, { force: input.force === true });
+				return { success: r.started, reason: r.reason, build: r.build };
 			},
 		},
 
@@ -415,6 +698,15 @@ const plugin: SandboxedPlugin = {
 							: `Issue #${number}: ${run.status}${run.reason ? ` — ${run.reason}` : ""}`,
 					);
 				}
+				if (i.type === "form_submit" && i.action_id === "build_pr") {
+					const setup = await requireSetup(ctx);
+					if (!setup.ok) return buildPage(ctx, setup.error);
+					const number = Number(i.values?.number);
+					const pr = Number.isInteger(number) && number > 0 ? await getPull(ctx, setup.conn, number) : null;
+					if (!pr) return buildPage(ctx, `PR #${number} not found.`);
+					const r = await buildPull(ctx, setup.settings, setup.conn, pr, { force: i.values?.force === true });
+					return buildPage(ctx, r.started ? `PR #${number}: ${r.build?.status ?? "built"} (attempt ${r.build?.attempt}).` : `PR #${number}: ${r.reason}`);
+				}
 				if (i.type === "block_action" && i.action_id === "poll_now") {
 					const r = await poll(ctx);
 					return buildPage(ctx, r.error ?? `Reconciled: ${r.dispatched} dispatched, ${r.refreshed} updated.`);
@@ -525,6 +817,44 @@ async function buildPage(ctx: PluginContext, notice?: string) {
 				};
 			}),
 		});
+		const builds = await listBuilds(ctx, 30);
+		blocks.push({ type: "divider" });
+		blocks.push({ type: "section", text: "Pull requests built by the platform (check:cf → build → static branch → test:cf)." });
+		blocks.push({
+			type: "table",
+			block_id: "pulls",
+			page_action_id: "pulls_page",
+			empty_text: "No pull requests built yet — PRs from whitelisted users are built as GitHub reports them.",
+			columns: [
+				{ key: "pr", label: "PR", format: "code" },
+				{ key: "title", label: "Title", format: "text" },
+				{ key: "branch", label: "Branch", format: "code" },
+				{ key: "status", label: "CI", format: "badge" },
+				{ key: "attempt", label: "Attempt", format: "text" },
+				{ key: "static", label: "Static branch", format: "code" },
+				{ key: "summary", label: "Result", format: "text" },
+				{ key: "updated", label: "Updated", format: "relative_time" },
+			],
+			rows: builds.map((b) => ({
+				pr: `#${b.pr}`,
+				title: b.title,
+				branch: b.headRef,
+				status: b.status,
+				attempt: `${b.attempt} / ${settings.maxBuildAttempts}`,
+				static: b.staticSha ? `${b.staticBranch} @ ${b.staticSha.slice(0, 7)}` : b.staticBranch,
+				summary: b.summary ?? "",
+				updated: b.updatedAt,
+			})),
+		});
+		blocks.push({
+			type: "form",
+			block_id: "build-pr",
+			fields: [
+				{ type: "number_input", action_id: "number", label: "Build pull request #", min: 1 },
+				{ type: "toggle", action_id: "force", label: "Ignore the attempt cap", initial_value: false },
+			],
+			submit: { label: "Build now", action_id: "build_pr" },
+		});
 		blocks.push({ type: "divider" });
 		blocks.push({
 			type: "form",
@@ -566,6 +896,14 @@ async function buildPage(ctx: PluginContext, notice?: string) {
 				label: "Whitelisted GitHub users",
 				placeholder: "octocat, another-user",
 				initial_value: settings.allowedUsers.join(", "),
+			},
+			{
+				type: "number_input",
+				action_id: "maxBuildAttempts",
+				label: "Max build attempts per PR",
+				initial_value: settings.maxBuildAttempts,
+				min: 1,
+				max: 10,
 			},
 			{ type: "text_input", action_id: "agentUrl", label: "Agent worker URL", initial_value: settings.agentUrl },
 			{

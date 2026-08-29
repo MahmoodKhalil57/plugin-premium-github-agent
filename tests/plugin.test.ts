@@ -21,6 +21,7 @@ function ctxWith(opts: {
 		Object.entries(opts.settings ?? {}).map(([k, v]) => [`settings:${k}`, v]),
 	);
 	const store = new Map<string, Record<string, unknown>>();
+	const builds = new Map<string, Record<string, unknown>>();
 	const calls: Array<{ url: string; init?: RequestInit }> = [];
 	const ctx = {
 		kv: {
@@ -35,6 +36,11 @@ function ctxWith(opts: {
 				put: async (id: string, data: Record<string, unknown>) => void store.set(id, data),
 				query: async () => ({ items: [...store.entries()].map(([id, data]) => ({ id, data })), hasMore: false }),
 			},
+			builds: {
+				get: async (id: string) => builds.get(id) ?? null,
+				put: async (id: string, data: Record<string, unknown>) => void builds.set(id, data),
+				query: async () => ({ items: [...builds.entries()].map(([id, data]) => ({ id, data })), hasMore: false }),
+			},
 		},
 		github: opts.github === undefined ? undefined : { get: async () => opts.github },
 		site: { name: "Site", url: "https://site.example", locale: "en" },
@@ -46,10 +52,19 @@ function ctxWith(opts: {
 		},
 		log: { debug() {}, info() {}, warn() {}, error() {} },
 	};
-	return { ctx, store, calls };
+	return { ctx, store, builds, calls };
 }
 
-const conn = { token: "gho_x", owner: "acme", repo: "site", branch: "main" };
+function pull(n: number, author: string, headRef: string, sha = "abc1234") {
+	return { number: n, title: `PR ${n}`, user: { login: author }, head: { ref: headRef, sha }, base: { ref: "main" }, html_url: `https://github.com/acme/site/pull/${n}`, state: "open", draft: false };
+}
+
+function ciResult(pr: number, attempt: number, ok: boolean) {
+	const step = (k: boolean) => ({ ok: k, log: k ? "fine" : "boom", seconds: 1 });
+	return { pr, attempt, headSha: "abc1234", staticBranch: "static/agent/issue-1-x", staticSha: ok ? "def5678" : null, check: step(true), build: step(ok), push: ok ? step(true) : null, test: ok ? step(true) : null, ok, ...(ok ? {} : { error: "build failed" }) };
+}
+
+const conn = { token: "gho_x", owner: "acme", repo: "site", branch: "main", previewSecret: "prev" };
 
 function issue(n: number, author: string, labels: string[] = ["agent"]) {
 	return {
@@ -193,5 +208,69 @@ describe("issues/run", () => {
 		expect(attempts).toEqual([1]);
 		await route("issues/run")({ input: { number: 9, again: true } }, ctx);
 		expect(attempts).toEqual([1, 2]);
+	});
+});
+
+describe("pull requests", () => {
+	it("builds a PR from a whitelisted author and records the passing result", async () => {
+		const { ctx, builds, calls } = ctxWith({
+			github: conn,
+			settings,
+			fetch: async (url, init) => {
+				if (url.endsWith("/pulls/10")) return Response.json(pull(10, "alice", "agent/issue-1-x"));
+				if (url.endsWith("/ci")) {
+					const body = JSON.parse(String(init?.body));
+					return Response.json(ciResult(10, body.attempt, true));
+				}
+				return Response.json({});
+			},
+		});
+		const r = (await route("webhook")({ input: { action: "opened", pull_request: pull(10, "alice", "agent/issue-1-x") } }, ctx)) as { started: boolean; status: string };
+		expect(r.started).toBe(true);
+		expect(r.status).toBe("passed");
+		expect(builds.get("10")).toMatchObject({ attempt: 1, staticBranch: "static/agent/issue-1-x", staticSha: "def5678", issue: 1 });
+		const ci = JSON.parse(String(calls.find((c) => c.url.endsWith("/ci"))?.init?.body));
+		expect(ci).toMatchObject({ pr: 10, headRef: "agent/issue-1-x", staticBranch: "static/agent/issue-1-x", previewSecret: "prev", token: "gho_x" });
+		expect(calls.some((c) => c.url.endsWith("/issues/10/comments"))).toBe(true);
+	});
+
+	it("asks the agent to fix a failing build on its own PR, then stops at the cap", async () => {
+		const runs: string[] = [];
+		const { ctx, builds } = ctxWith({
+			github: conn,
+			settings: { ...settings, maxBuildAttempts: 2 },
+			fetch: async (url, init) => {
+				if (url.endsWith("/pulls/11")) return Response.json(pull(11, "alice", "agent/issue-1-x"));
+				if (url.endsWith("/issues/1")) return Response.json(issue(1, "alice"));
+				if (url.endsWith("/ci")) return Response.json(ciResult(11, JSON.parse(String(init?.body)).attempt, false));
+				if (url.endsWith("/run")) {
+					runs.push(JSON.parse(String(init?.body)).note ?? "");
+					return Response.json({ submissionId: `s${runs.length}`, accepted: true });
+				}
+				return Response.json({});
+			},
+		});
+		const ev = { input: { action: "synchronize", pull_request: pull(11, "alice", "agent/issue-1-x") } };
+		await route("webhook")(ev, ctx);
+		expect(builds.get("11")?.status).toBe("failed");
+		expect(runs.length).toBe(1);
+		expect(runs[0]).toMatch(/CI failed on your pull request #11/);
+		await route("webhook")(ev, ctx);
+		expect(builds.get("11")?.status).toBe("capped");
+		expect(runs.length).toBe(1);
+		const third = (await route("webhook")(ev, ctx)) as { started: boolean; reason: string };
+		expect(third.started).toBe(false);
+		expect(third.reason).toMatch(/attempts/);
+	});
+
+	it("never builds a PR from a non-whitelisted author", async () => {
+		const { ctx, calls } = ctxWith({
+			github: conn,
+			settings,
+			fetch: async (url) => (url.endsWith("/pulls/12") ? Response.json(pull(12, "mallory", "feature")) : Response.json({})),
+		});
+		const r = (await route("webhook")({ input: { action: "opened", pull_request: pull(12, "mallory", "feature") } }, ctx)) as { started: boolean };
+		expect(r.started).toBe(false);
+		expect(calls.some((c) => c.url.endsWith("/ci"))).toBe(false);
 	});
 });

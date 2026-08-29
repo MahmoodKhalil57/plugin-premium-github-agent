@@ -14,6 +14,8 @@ export interface Settings {
 	/** Workers AI model id handed to the agent. */
 	model: string;
 	reasoning: "low" | "medium" | "high";
+	/** How many CI runs a PR gets before the agent stops retrying (fix → build → test loops). */
+	maxBuildAttempts: number;
 }
 
 export const DEFAULTS: Settings = {
@@ -24,9 +26,15 @@ export const DEFAULTS: Settings = {
 	agentKey: "",
 	model: "@cf/zai-org/glm-5.3-flash",
 	reasoning: "high",
+	maxBuildAttempts: 3,
 };
 
 const PREFIX = "settings:";
+
+function clampAttempts(v: unknown): number {
+	const n = Number(v);
+	return Number.isFinite(n) && n >= 1 ? Math.min(Math.floor(n), 10) : DEFAULTS.maxBuildAttempts;
+}
 
 export function parseUsers(raw: unknown): string[] {
 	if (Array.isArray(raw)) return raw.map(String).map(normalizeLogin).filter(Boolean);
@@ -53,6 +61,7 @@ export async function readSettings(ctx: PluginContext): Promise<Settings> {
 		agentKey: typeof map.agentKey === "string" ? map.agentKey : "",
 		model: (typeof map.model === "string" && map.model.trim()) || DEFAULTS.model,
 		reasoning: reasoning === "low" || reasoning === "medium" ? reasoning : "high",
+		maxBuildAttempts: clampAttempts(map.maxBuildAttempts),
 	};
 }
 
@@ -72,6 +81,9 @@ export async function saveSettings(ctx: PluginContext, values: Record<string, un
 	if (typeof values.model === "string") await ctx.kv.set(`${PREFIX}model`, values.model.trim() || DEFAULTS.model);
 	if (values.reasoning === "low" || values.reasoning === "medium" || values.reasoning === "high") {
 		await ctx.kv.set(`${PREFIX}reasoning`, values.reasoning);
+	}
+	if (values.maxBuildAttempts !== undefined) {
+		await ctx.kv.set(`${PREFIX}maxBuildAttempts`, clampAttempts(values.maxBuildAttempts));
 	}
 }
 

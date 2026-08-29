@@ -30,9 +30,35 @@ labelled issues into **open** pull requests.
    labelled for the agent), runs the agent on a given issue ("run again" retries
    a finished one as a new attempt), reconciles by hand, and holds the settings.
 
-Routes: `webhook` (platform-authenticated), `agent-callback` (public, signed),
-and admin-authenticated `issues`, `issues/create`, `issues/run`,
-`issues/comment`, `poll`, `settings`, `settings/save`.
+## Pull requests: check → build → static branch → test
+
+Every pull request from a whitelisted author (the agent's own PRs included) is
+built in a Cloudflare container by the agent worker (`POST /ci`, Sandbox SDK):
+
+1. `npm run check:cf` (the site's static checks),
+2. `astro build` against the site's live content snapshot,
+3. `dist/` is force-pushed to `static/<branch>` — one branch per PR that always
+   holds the latest build, so it can be served straight away later,
+4. `npm run test:cf`.
+
+The result is posted as a PR comment and a `premium-cms/ci` commit status. When
+the PR is the agent's own fix branch (`agent/issue-N-…`) and CI failed, the
+agent is asked to push a fix to the same branch with the failing output; GitHub
+reports the push (`synchronize`), CI runs again onto the same static branch —
+until it passes or **Max build attempts per PR** (default 3) is used up. The
+agent's own dry-run attempts are capped separately (each retry is a new
+attempt on the same issue). Everything stays open: one issue, one PR, one fix
+branch, one static branch.
+
+Routes: `webhook` (platform-authenticated: `issues` + `pull_request` events),
+`agent-callback` / `ci-callback` (public, HMAC-signed), and admin-authenticated
+`issues`, `issues/create`, `issues/run`, `issues/comment`, `pulls`,
+`pulls/build`, `poll`, `settings`, `settings/save`.
+
+The platform's GitHub App needs **Issues: read & write**, **Pull requests: read
+& write**, **Commit statuses: read & write**, and must subscribe to the
+**Issues** and **Pull request** events; each installation has to accept the
+permissions once.
 
 ## The agent worker
 

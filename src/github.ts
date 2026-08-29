@@ -11,6 +11,8 @@ export interface Connection {
 	owner: string;
 	repo: string;
 	branch: string;
+	/** Signs content-snapshot requests for builds; empty when the site has none. */
+	previewSecret: string;
 }
 
 export interface Issue {
@@ -75,7 +77,9 @@ function toIssue(raw: unknown): Issue | null {
 }
 
 export async function getConnection(ctx: PluginContext): Promise<Connection | null> {
-	return (await ctx.github?.get()) ?? null;
+	const c = await ctx.github?.get();
+	if (!c) return null;
+	return { ...c, previewSecret: (c as { previewSecret?: string }).previewSecret ?? "" };
 }
 
 /** Open issues (pull requests excluded), newest first. `label` narrows the list. */
@@ -137,4 +141,58 @@ export async function addLabels(
 export async function comment(ctx: PluginContext, conn: Connection, number: number, body: string): Promise<void> {
 	const r = await gh(ctx, conn, "POST", `/repos/${conn.owner}/${conn.repo}/issues/${number}/comments`, { body });
 	if (!r.ok) throw new Error(`GitHub ${r.status} commenting on issue #${number}`);
+}
+
+export interface PullRequest {
+	number: number;
+	title: string;
+	author: string;
+	headRef: string;
+	headSha: string;
+	baseRef: string;
+	url: string;
+	state: string;
+	draft: boolean;
+}
+
+function toPull(raw: unknown): PullRequest | null {
+	if (!raw || typeof raw !== "object") return null;
+	const r = raw as Record<string, unknown>;
+	const head = (r.head ?? {}) as Record<string, unknown>;
+	const base = (r.base ?? {}) as Record<string, unknown>;
+	const user = (r.user ?? {}) as Record<string, unknown>;
+	return {
+		number: Number(r.number),
+		title: String(r.title ?? ""),
+		author: String(user.login ?? ""),
+		headRef: String(head.ref ?? ""),
+		headSha: String(head.sha ?? ""),
+		baseRef: String(base.ref ?? ""),
+		url: String(r.html_url ?? ""),
+		state: String(r.state ?? ""),
+		draft: r.draft === true,
+	};
+}
+
+export async function getPull(ctx: PluginContext, conn: Connection, number: number): Promise<PullRequest | null> {
+	const r = await gh(ctx, conn, "GET", `/repos/${conn.owner}/${conn.repo}/pulls/${number}`);
+	if (r.status === 404) return null;
+	if (!r.ok) throw new Error(`GitHub ${r.status} reading PR #${number}`);
+	return toPull(r.json);
+}
+
+/** A commit status on the PR head (`context` groups the checks). Best-effort: needs the statuses permission. */
+export async function setStatus(
+	ctx: PluginContext,
+	conn: Connection,
+	sha: string,
+	status: { state: "pending" | "success" | "failure" | "error"; context: string; description: string; targetUrl?: string },
+): Promise<boolean> {
+	const r = await gh(ctx, conn, "POST", `/repos/${conn.owner}/${conn.repo}/statuses/${sha}`, {
+		state: status.state,
+		context: status.context,
+		description: status.description.slice(0, 140),
+		target_url: status.targetUrl,
+	});
+	return r.ok;
 }
