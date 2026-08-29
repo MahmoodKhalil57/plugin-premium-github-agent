@@ -21,7 +21,19 @@ export interface Run {
 	answer?: string;
 	prUrl?: string;
 	reason?: string;
+	/** How many times the agent was asked about this issue. */
+	attempt?: number;
 	updatedAt: string;
+}
+
+/** What the agent worker POSTs to `agent-callback` when a run ends. */
+export interface Callback {
+	issue: number;
+	attempt: number;
+	submissionId: string;
+	status: string;
+	answer: string | null;
+	prUrl: string | null;
 }
 
 export function runId(number: number): string {
@@ -58,6 +70,8 @@ export async function dispatch(
 	settings: Settings,
 	conn: Connection,
 	issue: number,
+	attempt: number,
+	callbackUrl: string,
 ): Promise<{ submissionId: string; accepted: boolean }> {
 	const r = await call(ctx, settings, "POST", "/run", {
 		owner: conn.owner,
@@ -67,6 +81,8 @@ export async function dispatch(
 		token: conn.token,
 		model: settings.model,
 		reasoning: settings.reasoning,
+		attempt,
+		callbackUrl,
 	});
 	if (!r.ok || typeof r.json.submissionId !== "string") {
 		throw new Error(`agent ${r.status}: ${String(r.json.error ?? "no submission id")}`);
@@ -100,4 +116,38 @@ export function prUrlFrom(answer: string | null | undefined): string | undefined
 	if (!answer) return undefined;
 	const m = answer.match(/https:\/\/github\.com\/[^\s)]+\/pull\/\d+/);
 	return m?.[0];
+}
+
+/**
+ * The callback is signed over the canonical JSON of its six fields, in this
+ * order, so it can be checked from the parsed body (routes never see raw bytes).
+ */
+export function canonicalCallback(c: Callback): string {
+	return JSON.stringify({
+		issue: c.issue,
+		attempt: c.attempt,
+		submissionId: c.submissionId,
+		status: c.status,
+		answer: c.answer,
+		prUrl: c.prUrl,
+	});
+}
+
+export async function hmacHex(secret: string, text: string): Promise<string> {
+	const key = await crypto.subtle.importKey(
+		"raw",
+		new TextEncoder().encode(secret),
+		{ name: "HMAC", hash: "SHA-256" },
+		false,
+		["sign"],
+	);
+	const sig = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(text));
+	return [...new Uint8Array(sig)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+export function timingSafeEqual(a: string, b: string): boolean {
+	if (a.length !== b.length) return false;
+	let diff = 0;
+	for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+	return diff === 0;
 }

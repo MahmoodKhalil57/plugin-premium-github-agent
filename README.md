@@ -17,16 +17,21 @@ labelled issues into **open** pull requests.
 
 ## How it works
 
-1. Every _N_ minutes (plugin cron) open issues with the trigger label
-   (default `agent`) are fetched.
-2. Issues by whitelisted users are handed to the agent worker (`POST /run`,
-   idempotent per issue). Progress is polled (`GET /status`) and stored in the
-   plugin's `runs` table; the PR link shows up on the admin page.
-3. The admin page (**GitHub Agent**) lists issues, creates new ones (optionally
-   labelled for the agent), runs the agent on a given issue and holds the
-   settings.
+1. GitHub delivers `issues` events to the platform's GitHub App webhook. The
+   parent control plane (projects plugin, `githubWebhook` route) routes each
+   event to the project whose site repo it belongs to and calls this plugin's
+   `webhook` route. Nothing is polled.
+2. The plugin re-reads the issue from GitHub with the site's own token: if it
+   carries the trigger label (default `agent`) and its author is whitelisted,
+   the agent worker is asked to run (`POST /run`, idempotent per issue+attempt).
+3. When the run ends the worker calls `agent-callback` (HMAC-signed with the
+   agent key) with the outcome; the PR link shows up on the admin page.
+4. The admin page (**GitHub Agent**) lists issues, creates new ones (optionally
+   labelled for the agent), runs the agent on a given issue ("run again" retries
+   a finished one as a new attempt), reconciles by hand, and holds the settings.
 
-Routes (admin-authenticated): `issues`, `issues/create`, `issues/run`,
+Routes: `webhook` (platform-authenticated), `agent-callback` (public, signed),
+and admin-authenticated `issues`, `issues/create`, `issues/run`,
 `issues/comment`, `poll`, `settings`, `settings/save`.
 
 ## The agent worker

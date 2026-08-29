@@ -38,6 +38,18 @@ export interface RunInput {
 	token: string;
 	model?: string;
 	reasoning?: "low" | "medium" | "high";
+	/** Retry counter: a new attempt is a new turn on the same object (default 1). */
+	attempt?: number;
+	/** Where to POST the outcome (signed with AGENT_KEY) when the run ends. */
+	callbackUrl?: string;
+}
+
+interface Watch {
+	submissionId: string;
+	issue: number;
+	attempt: number;
+	callbackUrl: string;
+	polls: number;
 }
 
 export class IssueFixer extends Think<Env> {
@@ -63,7 +75,7 @@ export class IssueFixer extends Think<Env> {
 		return [
 			skills.fromManifest({
 				id: "premium-cms-issue-agent",
-				fingerprint: "fix-github-issue@1",
+				fingerprint: "fix-github-issue@2",
 				skills: [FIX_ISSUE_SKILL],
 			}),
 		];
@@ -107,18 +119,68 @@ export class IssueFixer extends Think<Env> {
 			});
 		}
 
+		const attempt = Math.max(1, Math.floor(input.attempt ?? 1));
 		const text = [
 			`Repository: ${input.owner}/${input.repo} (default branch: ${input.branch})`,
 			`Issue: #${input.issue}`,
 			"",
-			"Fix this issue and open a pull request. Do not merge it.",
+			attempt > 1
+				? `This is attempt ${attempt}. Re-read the issue and the repository state (branches and pull requests you opened earlier may exist — reuse or correct them rather than duplicating). Fix this issue and open or update a pull request. Do not merge it.`
+				: "Fix this issue and open a pull request. Do not merge it.",
 		].join("\n");
 
 		const res = await this.submitMessages(
 			[{ id: crypto.randomUUID(), role: "user", parts: [{ type: "text", text }] }],
-			{ idempotencyKey: `issue-${input.issue}` },
+			{ idempotencyKey: `issue-${input.issue}-attempt-${attempt}` },
 		);
+		if (input.callbackUrl) {
+			const watch: Watch = {
+				submissionId: res.submissionId,
+				issue: input.issue,
+				attempt,
+				callbackUrl: input.callbackUrl,
+				polls: 0,
+			};
+			await this.schedule(20, "watch", watch);
+		}
 		return { submissionId: res.submissionId, accepted: res.accepted };
+	}
+
+	/**
+	 * Durable follow-up: re-checks the submission until it is terminal, then
+	 * POSTs `{issue, attempt, submissionId, status, answer, prUrl}` to the
+	 * callback, signed as `X-Agent-Signature: sha256=<hmac(AGENT_KEY, body)>`.
+	 */
+	async watch(w: Watch): Promise<void> {
+		const s = await this.status(w.submissionId);
+		const terminal = ["completed", "error", "aborted", "skipped", "unknown"].includes(s.status);
+		if (!terminal) {
+			if (w.polls < 360) await this.schedule(20, "watch", { ...w, polls: w.polls + 1 });
+			return;
+		}
+		const body = JSON.stringify({
+			issue: w.issue,
+			attempt: w.attempt,
+			submissionId: w.submissionId,
+			status: s.status,
+			answer: s.answer,
+			prUrl: s.answer?.match(/https:\/\/github\.com\/[^\s)]+\/pull\/\d+/)?.[0] ?? null,
+		});
+		const sig = await hmac(this.env.AGENT_KEY, body);
+		try {
+			const r = await fetch(w.callbackUrl, {
+				method: "POST",
+				headers: {
+					"Content-Type": "application/json",
+					"X-Agent-Signature": `sha256=${sig}`,
+					"User-Agent": "premium-cms-issue-agent/1.0",
+				},
+				body,
+			});
+			if (!r.ok && w.polls < 360) await this.schedule(60, "watch", { ...w, polls: w.polls + 30 });
+		} catch {
+			if (w.polls < 360) await this.schedule(60, "watch", { ...w, polls: w.polls + 30 });
+		}
 	}
 
 	/** Compact transcript: every text + tool part, for operators and the admin page. */
@@ -162,6 +224,18 @@ export class IssueFixer extends Think<Env> {
 	}
 }
 
+async function hmac(secret: string, body: string): Promise<string> {
+	const key = await crypto.subtle.importKey(
+		"raw",
+		new TextEncoder().encode(secret),
+		{ name: "HMAC", hash: "SHA-256" },
+		false,
+		["sign"],
+	);
+	const sig = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(body));
+	return [...new Uint8Array(sig)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
 function json(data: unknown, status = 200): Response {
 	return new Response(JSON.stringify(data), {
 		status,
@@ -203,6 +277,8 @@ export default {
 				token: body.token,
 				model: body.model,
 				reasoning: body.reasoning,
+				attempt: typeof body.attempt === "number" ? body.attempt : 1,
+				callbackUrl: typeof body.callbackUrl === "string" ? body.callbackUrl : undefined,
 			});
 			return json(out);
 		}

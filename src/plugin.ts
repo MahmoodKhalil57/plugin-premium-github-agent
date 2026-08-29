@@ -4,18 +4,31 @@
  *
  *   github    the site's GitHub connection (`ctx.github`) is the only
  *             credential; nothing is stored beyond the plugin's own settings.
- *   cron      every N minutes: open issues with the trigger label whose
- *             author is whitelisted are handed to the agent worker.
+ *   webhook   GitHub → the platform's GitHub App webhook → the parent control
+ *             plane routes the event by repository → this plugin's `webhook`
+ *             route. The issue is re-read from GitHub before anything happens,
+ *             so the event is only ever a hint.
  *   agent     a Cloudflare Worker running a Think agent (Workers AI +
  *             GitHub MCP). It reads the repo, writes a branch, opens a PR and
- *             leaves it open. No code is ever executed — dry coding only.
+ *             leaves it open, then calls back (`agent-callback`, HMAC-signed).
+ *             No code is ever executed — dry coding only.
  *   storage   `runs` — one row per issue the agent was asked about.
  *   admin     /github-agent page: issues, runs, "new issue", settings.
  */
 
 import type { PluginContext, SandboxedPlugin } from "@premium-cms/emdash/plugin";
 
-import { dispatch, prUrlFrom, runId, status as agentStatus, type Run } from "./agent.js";
+import {
+	canonicalCallback,
+	dispatch,
+	hmacHex,
+	prUrlFrom,
+	runId,
+	status as agentStatus,
+	timingSafeEqual,
+	type Callback,
+	type Run,
+} from "./agent.js";
 import {
 	addLabels,
 	comment,
@@ -26,9 +39,9 @@ import {
 	type Connection,
 	type Issue,
 } from "./github.js";
-import { cronFor, DEFAULTS, normalizeLogin, readSettings, saveSettings, type Settings } from "./settings.js";
+import { DEFAULTS, normalizeLogin, readSettings, saveSettings, type Settings } from "./settings.js";
 
-const CRON_TASK = "poll";
+const CALLBACK_PATH = "/_emdash/api/plugins/premium-github-agent/agent-callback";
 
 // ── Helpers ──────────────────────────────────────────────────────────────
 
@@ -62,6 +75,21 @@ function allowed(settings: Settings, author: string): boolean {
 	return settings.allowedUsers.includes(normalizeLogin(author));
 }
 
+/** Sandboxed routes get a serialized request (`headers` is a plain object). */
+function headerOf(request: unknown, name: string): string {
+	const h = isRecord(request) ? request.headers : null;
+	if (h && typeof (h as Headers).get === "function") return (h as Headers).get(name) ?? "";
+	if (isRecord(h)) {
+		const hit = Object.entries(h).find(([k]) => k.toLowerCase() === name.toLowerCase());
+		return hit ? String(hit[1]) : "";
+	}
+	return "";
+}
+
+function callbackUrl(ctx: PluginContext): string {
+	return `${ctx.site.url.replace(/\/+$/, "")}${CALLBACK_PATH}`;
+}
+
 async function requireSetup(
 	ctx: PluginContext,
 ): Promise<{ ok: true; conn: Connection; settings: Settings } | { ok: false; error: string }> {
@@ -72,20 +100,23 @@ async function requireSetup(
 }
 
 /**
- * Hand one issue to the agent. The whitelist is enforced here, for manual
- * runs and the cron alike — an unlisted author is recorded as skipped.
+ * Hand one issue to the agent. The whitelist is enforced here, for webhook
+ * and manual runs alike — an unlisted author is recorded as skipped.
+ * `again` retries an issue whose previous run already finished.
  */
 async function runIssue(
 	ctx: PluginContext,
 	settings: Settings,
 	conn: Connection,
 	issue: Issue,
+	again = false,
 ): Promise<Run> {
 	const existing = await getRun(ctx, issue.number);
 	if (existing && (existing.status === "queued" || existing.status === "running")) return existing;
-	if (existing?.status === "completed") return existing;
+	if (existing?.status === "completed" && !again) return existing;
+	const attempt = again ? (existing?.attempt ?? 1) + 1 : (existing?.attempt ?? 1);
 
-	const base = { number: issue.number, title: issue.title, author: issue.author, updatedAt: now() };
+	const base = { number: issue.number, title: issue.title, author: issue.author, attempt, updatedAt: now() };
 	if (!allowed(settings, issue.author)) {
 		const run: Run = { ...base, status: "skipped", reason: `@${issue.author} is not a whitelisted user` };
 		await putRun(ctx, run);
@@ -97,10 +128,10 @@ async function runIssue(
 		return run;
 	}
 	try {
-		const d = await dispatch(ctx, settings, conn, issue.number);
+		const d = await dispatch(ctx, settings, conn, issue.number, attempt, callbackUrl(ctx));
 		const run: Run = { ...base, status: "queued", submissionId: d.submissionId };
 		await putRun(ctx, run);
-		ctx.log.info(`issue #${issue.number} handed to the agent`, { submission: d.submissionId });
+		ctx.log.info(`issue #${issue.number} handed to the agent`, { submission: d.submissionId, attempt });
 		return run;
 	} catch (error) {
 		const run: Run = { ...base, status: "error", reason: String(error) };
@@ -110,18 +141,12 @@ async function runIssue(
 	}
 }
 
-/** Refresh one queued/running run from the agent worker. */
+/** Refresh one queued/running run from the agent worker (manual reconcile). */
 async function refreshRun(ctx: PluginContext, settings: Settings, conn: Connection, run: Run): Promise<Run> {
 	if (!run.submissionId || (run.status !== "queued" && run.status !== "running")) return run;
 	try {
 		const s = await agentStatus(ctx, settings, conn, run.number, run.submissionId);
-		let next: Run = run;
-		if (s.status === "running" || s.status === "pending") next = { ...run, status: "running" };
-		else if (s.status === "completed") {
-			next = { ...run, status: "completed", answer: s.answer ?? undefined, prUrl: prUrlFrom(s.answer) };
-		} else if (s.status === "error" || s.status === "aborted" || s.status === "skipped") {
-			next = { ...run, status: "error", reason: `agent ${s.status}` };
-		}
+		const next = applyOutcome(run, s.status, s.answer);
 		if (next !== run) await putRun(ctx, next);
 		return next;
 	} catch (error) {
@@ -130,17 +155,24 @@ async function refreshRun(ctx: PluginContext, settings: Settings, conn: Connecti
 	}
 }
 
-/** One poll: dispatch new labelled issues, refresh in-flight runs. */
+function applyOutcome(run: Run, status: string, answer: string | null): Run {
+	if (status === "running" || status === "pending") return run.status === "running" ? run : { ...run, status: "running" };
+	if (status === "completed") return { ...run, status: "completed", answer: answer ?? undefined, prUrl: prUrlFrom(answer) };
+	if (status === "error" || status === "aborted" || status === "skipped" || status === "unknown") {
+		return { ...run, status: "error", reason: `agent ${status}` };
+	}
+	return run;
+}
+
+/** Manual reconcile: dispatch labelled issues not seen yet, refresh in-flight runs. */
 async function poll(ctx: PluginContext): Promise<{ dispatched: number; refreshed: number; error?: string }> {
 	const setup = await requireSetup(ctx);
 	if (!setup.ok) return { dispatched: 0, refreshed: 0, error: setup.error };
 	const { conn, settings } = setup;
 
 	let dispatched = 0;
-	const issues = await listIssues(ctx, conn, { label: settings.label, limit: 30 });
-	for (const issue of issues) {
-		const before = await getRun(ctx, issue.number);
-		if (before) continue;
+	for (const issue of await listIssues(ctx, conn, { label: settings.label, limit: 30 })) {
+		if (await getRun(ctx, issue.number)) continue;
 		const run = await runIssue(ctx, settings, conn, issue);
 		if (run.status === "queued") dispatched++;
 	}
@@ -154,10 +186,14 @@ async function poll(ctx: PluginContext): Promise<{ dispatched: number; refreshed
 	return { dispatched, refreshed };
 }
 
-async function reschedule(ctx: PluginContext, settings: Settings): Promise<void> {
-	if (!ctx.cron) return;
-	await ctx.cron.cancel(CRON_TASK).catch(() => undefined);
-	if (settings.enabled) await ctx.cron.schedule(CRON_TASK, { schedule: cronFor(settings.pollMinutes) });
+/** A GitHub `issues` event, as forwarded by the parent control plane. */
+function issueNumberFromEvent(input: unknown): { action: string; number: number; label: string } | null {
+	if (!isRecord(input)) return null;
+	const issue = isRecord(input.issue) ? input.issue : null;
+	const number = Number(issue?.number);
+	if (!Number.isInteger(number) || number <= 0) return null;
+	const label = isRecord(input.label) ? String(input.label.name ?? "") : "";
+	return { action: String(input.action ?? ""), number, label };
 }
 
 // ── Plugin ───────────────────────────────────────────────────────────────
@@ -169,25 +205,67 @@ const plugin: SandboxedPlugin = {
 				if (k === "agentKey" || k === "allowedUsers") continue;
 				if ((await ctx.kv.get(`settings:${k}`)) === null) await ctx.kv.set(`settings:${k}`, v);
 			}
-			await reschedule(ctx, await readSettings(ctx));
 			ctx.log.info("GitHub agent installed");
-		},
-
-		"plugin:uninstall": async (_event, ctx) => {
-			await ctx.cron?.cancel(CRON_TASK).catch(() => undefined);
-		},
-
-		cron: async (event, ctx) => {
-			if (event.name !== CRON_TASK) return;
-			const settings = await readSettings(ctx);
-			if (!settings.enabled) return;
-			const r = await poll(ctx);
-			if (r.error) ctx.log.warn(`poll skipped: ${r.error}`);
-			else if (r.dispatched || r.refreshed) ctx.log.info("poll", r);
 		},
 	},
 
 	routes: {
+		/**
+		 * GitHub `issues` events, forwarded by the parent control plane (it
+		 * authenticates as the platform). Only `opened`/`labeled`/`reopened`
+		 * matter, and the issue is re-read from GitHub before anything runs.
+		 */
+		webhook: {
+			handler: async (routeCtx, ctx) => {
+				const ev = issueNumberFromEvent(routeCtx.input);
+				if (!ev) return { success: true, ignored: "not an issue event" };
+				if (!["opened", "labeled", "reopened"].includes(ev.action)) {
+					return { success: true, ignored: `action ${ev.action}` };
+				}
+				const setup = await requireSetup(ctx);
+				if (!setup.ok) return { success: false, error: setup.error };
+				if (!setup.settings.enabled) return { success: true, ignored: "disabled" };
+				if (ev.action === "labeled" && ev.label && ev.label !== setup.settings.label) {
+					return { success: true, ignored: `label ${ev.label}` };
+				}
+				const issue = await getIssue(ctx, setup.conn, ev.number);
+				if (!issue) return { success: true, ignored: "issue not found" };
+				if (!issue.labels.includes(setup.settings.label)) {
+					return { success: true, ignored: "trigger label not present" };
+				}
+				const run = await runIssue(ctx, setup.settings, setup.conn, issue);
+				return { success: true, run: { number: run.number, status: run.status, reason: run.reason } };
+			},
+		},
+
+		/** The agent worker's signed outcome for a run. */
+		"agent-callback": {
+			public: true,
+			handler: async (routeCtx, ctx) => {
+				const input = isRecord(routeCtx.input) ? routeCtx.input : {};
+				const cb: Callback = {
+					issue: Number(input.issue),
+					attempt: Number(input.attempt),
+					submissionId: String(input.submissionId ?? ""),
+					status: String(input.status ?? ""),
+					answer: typeof input.answer === "string" ? input.answer : null,
+					prUrl: typeof input.prUrl === "string" ? input.prUrl : null,
+				};
+				const settings = await readSettings(ctx);
+				const given = headerOf(routeCtx.request, "X-Agent-Signature").replace(/^sha256=/, "");
+				if (!settings.agentKey || !given) return { success: false, error: "unsigned" };
+				const expected = await hmacHex(settings.agentKey, canonicalCallback(cb));
+				if (!timingSafeEqual(given, expected)) return { success: false, error: "bad signature" };
+
+				const run = await getRun(ctx, cb.issue);
+				if (!run || run.submissionId !== cb.submissionId) return { success: true, ignored: "unknown run" };
+				const next = applyOutcome(run, cb.status, cb.answer);
+				if (cb.prUrl && !next.prUrl) next.prUrl = cb.prUrl;
+				await putRun(ctx, next);
+				return { success: true, status: next.status };
+			},
+		},
+
 		/** Open issues on the connected repo, with the agent's state per issue. */
 		issues: {
 			handler: async (routeCtx, ctx) => {
@@ -204,7 +282,7 @@ const plugin: SandboxedPlugin = {
 					items.push({
 						...issue,
 						whitelisted: allowed(setup.settings, issue.author),
-						agent: run ? { status: run.status, prUrl: run.prUrl, reason: run.reason } : null,
+						agent: run ? { status: run.status, prUrl: run.prUrl, reason: run.reason, attempt: run.attempt } : null,
 					});
 				}
 				return { success: true, repo: `${setup.conn.owner}/${setup.conn.repo}`, items };
@@ -230,7 +308,7 @@ const plugin: SandboxedPlugin = {
 			},
 		},
 
-		/** Hand one issue to the agent now (whitelist still applies). */
+		/** Hand one issue to the agent now (whitelist still applies); `again: true` retries a finished run. */
 		"issues/run": {
 			handler: async (routeCtx, ctx) => {
 				const setup = await requireSetup(ctx);
@@ -243,12 +321,12 @@ const plugin: SandboxedPlugin = {
 				if (!issue.labels.includes(setup.settings.label)) {
 					await addLabels(ctx, setup.conn, number, [setup.settings.label]);
 				}
-				const run = await runIssue(ctx, setup.settings, setup.conn, issue);
+				const run = await runIssue(ctx, setup.settings, setup.conn, issue, input.again === true);
 				return { success: run.status !== "error" && run.status !== "skipped", run };
 			},
 		},
 
-		/** Poll now: dispatch new labelled issues and refresh in-flight runs. */
+		/** Manual reconcile: dispatch labelled issues not seen yet, refresh in-flight runs. */
 		poll: {
 			handler: async (_routeCtx, ctx) => {
 				const r = await poll(ctx);
@@ -281,7 +359,6 @@ const plugin: SandboxedPlugin = {
 			handler: async (routeCtx, ctx) => {
 				await saveSettings(ctx, isRecord(routeCtx.input) ? routeCtx.input : {});
 				const settings = await readSettings(ctx);
-				await reschedule(ctx, settings);
 				return { success: true, settings: { ...settings, agentKey: settings.agentKey ? "set" : "" } };
 			},
 		},
@@ -298,7 +375,6 @@ const plugin: SandboxedPlugin = {
 				if (i.type === "page_load" && i.page === "widget:agent-runs") return buildWidget(ctx);
 				if (i.type === "form_submit" && i.action_id === "save_settings") {
 					await saveSettings(ctx, i.values ?? {});
-					await reschedule(ctx, await readSettings(ctx));
 					return buildPage(ctx, "Settings saved.");
 				}
 				if (i.type === "form_submit" && i.action_id === "create_issue") {
@@ -314,7 +390,10 @@ const plugin: SandboxedPlugin = {
 							body: typeof v.body === "string" ? v.body : "",
 							labels,
 						});
-						return buildPage(ctx, `Issue #${issue.number} created${labels.length ? " and handed to the agent on the next poll" : ""}.`);
+						return buildPage(
+							ctx,
+							`Issue #${issue.number} created${labels.length ? " — the agent starts as soon as GitHub delivers the event" : ""}.`,
+						);
 					} catch (error) {
 						return buildPage(ctx, String(error));
 					}
@@ -328,17 +407,17 @@ const plugin: SandboxedPlugin = {
 					if (!issue.labels.includes(setup.settings.label)) {
 						await addLabels(ctx, setup.conn, number, [setup.settings.label]).catch(() => undefined);
 					}
-					const run = await runIssue(ctx, setup.settings, setup.conn, issue);
+					const run = await runIssue(ctx, setup.settings, setup.conn, issue, i.values?.again === true);
 					return buildPage(
 						ctx,
 						run.status === "queued"
-							? `Issue #${number} handed to the agent.`
+							? `Issue #${number} handed to the agent (attempt ${run.attempt ?? 1}).`
 							: `Issue #${number}: ${run.status}${run.reason ? ` — ${run.reason}` : ""}`,
 					);
 				}
 				if (i.type === "block_action" && i.action_id === "poll_now") {
 					const r = await poll(ctx);
-					return buildPage(ctx, r.error ?? `Polled: ${r.dispatched} dispatched, ${r.refreshed} updated.`);
+					return buildPage(ctx, r.error ?? `Reconciled: ${r.dispatched} dispatched, ${r.refreshed} updated.`);
 				}
 				return buildPage(ctx);
 			},
@@ -369,12 +448,13 @@ async function buildPage(ctx: PluginContext, notice?: string) {
 			type: "banner",
 			variant: "alert",
 			title: "GitHub is not connected",
-			description: "Connect the site's GitHub repository in Settings → General. The agent uses that connection to read issues and open pull requests.",
+			description:
+				"Connect the site's GitHub repository in Settings → General. The agent uses that connection to read issues and open pull requests.",
 		});
 	} else {
 		blocks.push({
 			type: "context",
-			text: `Repository ${conn.owner}/${conn.repo} (${conn.branch}). Open issues labelled "${settings.label}" by whitelisted users are handed to the agent every ${settings.pollMinutes} min${settings.enabled ? "" : " — polling is off"}.`,
+			text: `Repository ${conn.owner}/${conn.repo} (${conn.branch}). Issues labelled "${settings.label}" by whitelisted users are handed to the agent the moment GitHub reports them${settings.enabled ? "" : " — currently OFF"}.`,
 		});
 		if (settings.allowedUsers.length === 0) {
 			blocks.push({
@@ -415,7 +495,7 @@ async function buildPage(ctx: PluginContext, notice?: string) {
 		});
 		blocks.push({
 			type: "actions",
-			elements: [{ type: "button", action_id: "poll_now", label: "Poll now", style: "secondary" }],
+			elements: [{ type: "button", action_id: "poll_now", label: "Reconcile now", style: "secondary" }],
 		});
 		blocks.push({ type: "divider" });
 		blocks.push({
@@ -452,14 +532,23 @@ async function buildPage(ctx: PluginContext, notice?: string) {
 			fields: [
 				{ type: "text_input", action_id: "title", label: "Title" },
 				{ type: "text_input", action_id: "body", label: "Description", multiline: true },
-				{ type: "toggle", action_id: "agent", label: "Hand to the agent", description: `Adds the "${settings.label}" label.`, initial_value: true },
+				{
+					type: "toggle",
+					action_id: "agent",
+					label: "Hand to the agent",
+					description: `Adds the "${settings.label}" label.`,
+					initial_value: true,
+				},
 			],
 			submit: { label: "Create issue", action_id: "create_issue" },
 		});
 		blocks.push({
 			type: "form",
 			block_id: "run-issue",
-			fields: [{ type: "number_input", action_id: "number", label: "Run the agent on issue #", min: 1 }],
+			fields: [
+				{ type: "number_input", action_id: "number", label: "Run the agent on issue #", min: 1 },
+				{ type: "toggle", action_id: "again", label: "Run again even if it already finished", initial_value: false },
+			],
 			submit: { label: "Run now", action_id: "run_issue" },
 		});
 	}
@@ -469,7 +558,7 @@ async function buildPage(ctx: PluginContext, notice?: string) {
 		type: "form",
 		block_id: "settings",
 		fields: [
-			{ type: "toggle", action_id: "enabled", label: "Poll for labelled issues", initial_value: settings.enabled },
+			{ type: "toggle", action_id: "enabled", label: "React to labelled issues", initial_value: settings.enabled },
 			{ type: "text_input", action_id: "label", label: "Trigger label", initial_value: settings.label },
 			{
 				type: "text_input",
@@ -478,9 +567,12 @@ async function buildPage(ctx: PluginContext, notice?: string) {
 				placeholder: "octocat, another-user",
 				initial_value: settings.allowedUsers.join(", "),
 			},
-			{ type: "number_input", action_id: "pollMinutes", label: "Poll every (minutes)", initial_value: settings.pollMinutes, min: 1, max: 60 },
 			{ type: "text_input", action_id: "agentUrl", label: "Agent worker URL", initial_value: settings.agentUrl },
-			{ type: "secret_input", action_id: "agentKey", label: settings.agentKey ? "Agent key (set — leave blank to keep)" : "Agent key" },
+			{
+				type: "secret_input",
+				action_id: "agentKey",
+				label: settings.agentKey ? "Agent key (set — leave blank to keep)" : "Agent key",
+			},
 			{ type: "text_input", action_id: "model", label: "Model", initial_value: settings.model },
 			{
 				type: "select",

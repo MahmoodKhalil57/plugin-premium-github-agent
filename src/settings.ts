@@ -1,7 +1,7 @@
 import type { PluginContext } from "@premium-cms/emdash/plugin";
 
 export interface Settings {
-	/** Master switch for the cron poll. Manual runs still work. */
+	/** Master switch: webhook-triggered runs are ignored while off. */
 	enabled: boolean;
 	/** Issues carrying this label are picked up. */
 	label: string;
@@ -14,8 +14,6 @@ export interface Settings {
 	/** Workers AI model id handed to the agent. */
 	model: string;
 	reasoning: "low" | "medium" | "high";
-	/** Poll cadence in minutes (cron granularity). */
-	pollMinutes: number;
 }
 
 export const DEFAULTS: Settings = {
@@ -26,7 +24,6 @@ export const DEFAULTS: Settings = {
 	agentKey: "",
 	model: "@cf/zai-org/glm-5.3-flash",
 	reasoning: "high",
-	pollMinutes: 5,
 };
 
 const PREFIX = "settings:";
@@ -44,7 +41,6 @@ export function normalizeLogin(login: string): string {
 export async function readSettings(ctx: PluginContext): Promise<Settings> {
 	const map: Record<string, unknown> = {};
 	for (const e of await ctx.kv.list(PREFIX)) map[e.key.slice(PREFIX.length)] = e.value;
-	const poll = Number(map.pollMinutes);
 	const reasoning = String(map.reasoning ?? "");
 	return {
 		enabled: typeof map.enabled === "boolean" ? map.enabled : DEFAULTS.enabled,
@@ -57,7 +53,6 @@ export async function readSettings(ctx: PluginContext): Promise<Settings> {
 		agentKey: typeof map.agentKey === "string" ? map.agentKey : "",
 		model: (typeof map.model === "string" && map.model.trim()) || DEFAULTS.model,
 		reasoning: reasoning === "low" || reasoning === "medium" ? reasoning : "high",
-		pollMinutes: Number.isFinite(poll) && poll >= 1 ? Math.min(Math.floor(poll), 60) : DEFAULTS.pollMinutes,
 	};
 }
 
@@ -78,10 +73,6 @@ export async function saveSettings(ctx: PluginContext, values: Record<string, un
 	if (values.reasoning === "low" || values.reasoning === "medium" || values.reasoning === "high") {
 		await ctx.kv.set(`${PREFIX}reasoning`, values.reasoning);
 	}
-	const poll = Number(values.pollMinutes);
-	if (Number.isFinite(poll) && poll >= 1) await ctx.kv.set(`${PREFIX}pollMinutes`, Math.min(Math.floor(poll), 60));
 }
 
-export function cronFor(pollMinutes: number): string {
-	return pollMinutes >= 60 ? "0 * * * *" : `*/${pollMinutes} * * * *`;
-}
+/** Master switch: with `enabled` off, webhooks and manual runs are ignored. */

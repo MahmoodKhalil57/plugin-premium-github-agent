@@ -34,7 +34,17 @@ this is dry coding: read carefully, change little, explain clearly.
 - Commit with \`create_or_update_file\` (one file) or \`push_files\` (several files) on
   that branch. Always send the COMPLETE new file content — never a diff or a
   fragment. Re-read the file's \`sha\` first when updating a single file.
+- The content you send must be the original file byte-for-byte except for the
+  lines you mean to change. Backslashes, escape sequences (\`\\\\.\`, \`\\n\`), tabs,
+  quotes, trailing newlines and blank lines stay exactly as they were — copying a
+  file through your own output tends to "clean up" escapes, and that breaks code.
 - Commit message: \`fix: <what> (#<issue number>)\`.
+
+## 3b. Verify your commit before opening the PR
+- \`get_file_contents\` for each changed file on YOUR branch and compare it with
+  the original you read in step 2. Every difference must be one you intended.
+- If anything else changed (an escape, a newline, indentation), commit a
+  corrected version of the file on the same branch before continuing.
 
 ## 4. Open the pull request
 - \`create_pull_request\` from the branch into the default branch. Leave it open —
