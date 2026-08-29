@@ -1,0 +1,13 @@
+{
+	"$schema": "node_modules/wrangler/config-schema.json",
+	"name": "premium-cms-issue-agent",
+	"main": "src/server.ts",
+	"compatibility_date": "2026-08-01",
+	"compatibility_flags": ["nodejs_compat"],
+	"ai": { "binding": "AI" },
+	"durable_objects": {
+		"bindings": [{ "class_name": "IssueFixer", "name": "IssueFixer" }]
+	},
+	"migrations": [{ "new_sqlite_classes": ["IssueFixer"], "tag": "v1" }],
+	"observability": { "enabled": true }
+}

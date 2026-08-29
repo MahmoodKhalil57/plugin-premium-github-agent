@@ -1,0 +1,87 @@
+import type { PluginContext } from "@premium-cms/emdash/plugin";
+
+export interface Settings {
+	/** Master switch for the cron poll. Manual runs still work. */
+	enabled: boolean;
+	/** Issues carrying this label are picked up. */
+	label: string;
+	/** GitHub logins (lowercase) whose issues the agent may work on. */
+	allowedUsers: string[];
+	/** The Cloudflare Worker running the Think agent. */
+	agentUrl: string;
+	/** Shared secret for that worker (never shown back). */
+	agentKey: string;
+	/** Workers AI model id handed to the agent. */
+	model: string;
+	reasoning: "low" | "medium" | "high";
+	/** Poll cadence in minutes (cron granularity). */
+	pollMinutes: number;
+}
+
+export const DEFAULTS: Settings = {
+	enabled: true,
+	label: "agent",
+	allowedUsers: [],
+	agentUrl: "https://premium-cms-issue-agent.premiumcms.workers.dev",
+	agentKey: "",
+	model: "@cf/zai-org/glm-5.3-flash",
+	reasoning: "high",
+	pollMinutes: 5,
+};
+
+const PREFIX = "settings:";
+
+export function parseUsers(raw: unknown): string[] {
+	if (Array.isArray(raw)) return raw.map(String).map(normalizeLogin).filter(Boolean);
+	if (typeof raw !== "string") return [];
+	return raw.split(/[\s,]+/).map(normalizeLogin).filter(Boolean);
+}
+
+export function normalizeLogin(login: string): string {
+	return login.trim().replace(/^@/, "").toLowerCase();
+}
+
+export async function readSettings(ctx: PluginContext): Promise<Settings> {
+	const map: Record<string, unknown> = {};
+	for (const e of await ctx.kv.list(PREFIX)) map[e.key.slice(PREFIX.length)] = e.value;
+	const poll = Number(map.pollMinutes);
+	const reasoning = String(map.reasoning ?? "");
+	return {
+		enabled: typeof map.enabled === "boolean" ? map.enabled : DEFAULTS.enabled,
+		label: (typeof map.label === "string" && map.label.trim()) || DEFAULTS.label,
+		allowedUsers: parseUsers(map.allowedUsers),
+		agentUrl: ((typeof map.agentUrl === "string" && map.agentUrl.trim()) || DEFAULTS.agentUrl).replace(
+			/\/+$/,
+			"",
+		),
+		agentKey: typeof map.agentKey === "string" ? map.agentKey : "",
+		model: (typeof map.model === "string" && map.model.trim()) || DEFAULTS.model,
+		reasoning: reasoning === "low" || reasoning === "medium" ? reasoning : "high",
+		pollMinutes: Number.isFinite(poll) && poll >= 1 ? Math.min(Math.floor(poll), 60) : DEFAULTS.pollMinutes,
+	};
+}
+
+export async function saveSettings(ctx: PluginContext, values: Record<string, unknown>): Promise<void> {
+	if (typeof values.enabled === "boolean") await ctx.kv.set(`${PREFIX}enabled`, values.enabled);
+	if (typeof values.label === "string") await ctx.kv.set(`${PREFIX}label`, values.label.trim() || DEFAULTS.label);
+	if (typeof values.allowedUsers === "string") {
+		await ctx.kv.set(`${PREFIX}allowedUsers`, parseUsers(values.allowedUsers).join(", "));
+	}
+	if (typeof values.agentUrl === "string") {
+		await ctx.kv.set(`${PREFIX}agentUrl`, values.agentUrl.trim().replace(/\/+$/, "") || DEFAULTS.agentUrl);
+	}
+	// An empty secret field means "keep what is stored".
+	if (typeof values.agentKey === "string" && values.agentKey.trim()) {
+		await ctx.kv.set(`${PREFIX}agentKey`, values.agentKey.trim());
+	}
+	if (typeof values.model === "string") await ctx.kv.set(`${PREFIX}model`, values.model.trim() || DEFAULTS.model);
+	if (values.reasoning === "low" || values.reasoning === "medium" || values.reasoning === "high") {
+		await ctx.kv.set(`${PREFIX}reasoning`, values.reasoning);
+	}
+	const poll = Number(values.pollMinutes);
+	if (Number.isFinite(poll) && poll >= 1) await ctx.kv.set(`${PREFIX}pollMinutes`, Math.min(Math.floor(poll), 60));
+}
+
+export function cronFor(pollMinutes: number): string {
+	return pollMinutes >= 60 ? "0 * * * *" : `*/${pollMinutes} * * * *`;
+}

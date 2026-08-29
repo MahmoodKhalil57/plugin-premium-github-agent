@@ -1,8 +1,8 @@
 {
-	"name": "premium-cms-plugin",
+	"name": "premium-cms-plugin-premium-github-agent",
 	"version": "0.1.0",
 	"type": "module",
-	"description": "A PremiumCMS plugin",
+	"description": "PremiumCMS GitHub Agent: issues on the connected repo + a Cloudflare-hosted coding agent that opens fix PRs",
 	"main": "dist/index.mjs",
 	"exports": {
 		".": {
@@ -24,12 +24,12 @@
 		"test": "vitest run"
 	},
 	"peerDependencies": {
-		"@premium-cms/emdash": ">=0.35.0"
+		"@premium-cms/emdash": ">=0.35.27"
 	},
 	"devDependencies": {
-		"@premium-cms/plugin-cli": "^0.8.1",
-		"@premium-cms/plugin-types": "^0.3.0",
-		"@premium-cms/emdash": "^0.35.0",
+		"@premium-cms/plugin-cli": "^0.8.2",
+		"@premium-cms/plugin-types": "^0.3.2",
+		"@premium-cms/emdash": "^0.35.27",
 		"typescript": "^6.0.3",
 		"vitest": "^4.1.5"
 	}
