@@ -21,6 +21,7 @@ import type { PluginContext, SandboxedPlugin } from "@premium-cms/emdash/plugin"
 import {
 	canonicalCallback,
 	canonicalCi,
+	ciStatus,
 	deletePreview,
 	dispatch,
 	dispatchCi,
@@ -54,6 +55,12 @@ import { DEFAULTS, normalizeLogin, readSettings, saveSettings, type Settings } f
 const CALLBACK_PATH = "/_emdash/api/plugins/premium-github-agent/agent-callback";
 const CI_CALLBACK_PATH = "/_emdash/api/plugins/premium-github-agent/ci-callback";
 const STATUS_CONTEXT = "premium-cms/ci";
+/** A build still "running" after this long lost its callback; a new one may start. */
+const STALE_BUILD_MS = 30 * 60 * 1000;
+
+function isStale(b: { status: string; updatedAt: string }): boolean {
+	return b.status === "running" && Date.now() - Date.parse(b.updatedAt) > STALE_BUILD_MS;
+}
 const AGENT_BRANCH = /^agent\/issue-(\d+)-/;
 
 // ── Helpers ──────────────────────────────────────────────────────────────
@@ -197,6 +204,19 @@ async function poll(ctx: PluginContext): Promise<{ dispatched: number; refreshed
 		const after = await refreshRun(ctx, settings, conn, run);
 		if (after.status !== run.status) refreshed++;
 	}
+	// Builds whose callback never arrived: take the worker's stored result.
+	for (const b of await listBuilds(ctx, 50)) {
+		if (b.status !== "running") continue;
+		try {
+			const s = await ciStatus(ctx, settings, conn, { pr: b.pr, branch: b.pr > 0 ? undefined : b.headRef });
+			if (s.last && s.last.attempt === b.attempt && (!s.running || s.running.attempt !== b.attempt)) {
+				const after = b.pr > 0 ? await recordCi(ctx, settings, conn, s.last) : await recordBranchCi(ctx, settings, conn, s.last);
+				if (after && after.status !== "running") refreshed++;
+			}
+		} catch (error) {
+			ctx.log.warn(`build ${b.pr > 0 ? `#${b.pr}` : b.headRef}: status check failed`, error);
+		}
+	}
 	return { dispatched, refreshed };
 }
 
@@ -334,7 +354,7 @@ async function buildPull(
 	if (pr.state !== "open") return { started: false, reason: `PR is ${pr.state}` };
 
 	const existing = await getBuild(ctx, pr.number);
-	if (existing?.status === "running" && existing.headSha === pr.headSha && !opts.force) {
+	if (existing?.status === "running" && existing.headSha === pr.headSha && !opts.force && !isStale(existing)) {
 		return { started: false, reason: "already building this commit", build: existing };
 	}
 	const attempt = (existing?.attempt ?? 0) + 1;
@@ -479,7 +499,7 @@ async function buildDefaultBranch(
 	if (!settings.agentKey) return { started: false, reason: "Agent key is not set in the plugin settings" };
 	const branch = conn.branch;
 	const existing = await getBranchBuild(ctx, branch);
-	if (existing?.status === "running") {
+	if (existing?.status === "running" && !isStale(existing)) {
 		await putBuild(ctx, { ...existing, rebuild: true });
 		return { started: false, reason: "build in progress — queued a rebuild" };
 	}

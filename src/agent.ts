@@ -236,3 +236,20 @@ export function timingSafeEqual(a: string, b: string): boolean {
 	for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
 	return diff === 0;
 }
+
+/** The worker's record of a build: what is running and the last finished result. */
+export async function ciStatus(
+	ctx: PluginContext,
+	settings: Settings,
+	conn: Connection,
+	target: { pr: number; branch?: string },
+): Promise<{ running: { attempt: number } | null; last: CiResult | null }> {
+	const q = new URLSearchParams({ owner: conn.owner, repo: conn.repo, pr: String(target.pr) });
+	if (target.branch) q.set("branch", target.branch);
+	const r = await call(ctx, settings, "GET", `/ci/status?${q}`);
+	if (!r.ok) throw new Error(`agent ${r.status}: ${String(r.json.error ?? "status failed")}`);
+	return {
+		running: (r.json.running as { attempt: number } | null) ?? null,
+		last: (r.json.last as CiResult | null) ?? null,
+	};
+}
