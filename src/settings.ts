@@ -3,8 +3,6 @@ import type { PluginContext } from "@premium-cms/emdash/plugin";
 export interface Settings {
 	/** Master switch: webhook-triggered runs are ignored while off. */
 	enabled: boolean;
-	/** Issues carrying this label are picked up. */
-	label: string;
 	/** GitHub logins (lowercase) whose issues the agent may work on. */
 	allowedUsers: string[];
 	/** The Cloudflare Worker running the Think agent. */
@@ -22,7 +20,6 @@ export interface Settings {
 
 export const DEFAULTS: Settings = {
 	enabled: true,
-	label: "agent",
 	allowedUsers: [],
 	agentUrl: "https://premium-cms-issue-agent.premiumcms.workers.dev",
 	agentKey: "",
@@ -55,7 +52,6 @@ export async function readSettings(ctx: PluginContext): Promise<Settings> {
 	const reasoning = String(map.reasoning ?? "");
 	return {
 		enabled: typeof map.enabled === "boolean" ? map.enabled : DEFAULTS.enabled,
-		label: (typeof map.label === "string" && map.label.trim()) || DEFAULTS.label,
 		allowedUsers: parseUsers(map.allowedUsers),
 		agentUrl: ((typeof map.agentUrl === "string" && map.agentUrl.trim()) || DEFAULTS.agentUrl).replace(
 			/\/+$/,
@@ -71,7 +67,6 @@ export async function readSettings(ctx: PluginContext): Promise<Settings> {
 
 export async function saveSettings(ctx: PluginContext, values: Record<string, unknown>): Promise<void> {
 	if (typeof values.enabled === "boolean") await ctx.kv.set(`${PREFIX}enabled`, values.enabled);
-	if (typeof values.label === "string") await ctx.kv.set(`${PREFIX}label`, values.label.trim() || DEFAULTS.label);
 	if (typeof values.allowedUsers === "string") {
 		await ctx.kv.set(`${PREFIX}allowedUsers`, parseUsers(values.allowedUsers).join(", "));
 	}

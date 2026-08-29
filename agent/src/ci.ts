@@ -106,10 +106,15 @@ async function waitForPreview(url: string): Promise<void> {
 	}
 }
 
+/** Stage names reported while a run progresses (each maps to a PR comment command). */
+export type CiStage = "check" | "test" | "preview" | "previewTest";
+export type StageReporter = (stage: CiStage, result: StepResult, extra?: { previewUrl?: string }) => Promise<void>;
+
 export async function runCi(
 	ns: DurableObjectNamespace<Sandbox>,
 	input: CiInput,
 	host: PreviewHost | null,
+	report: StageReporter = async () => undefined,
 ): Promise<CiResult> {
 	const out: CiResult = {
 		pr: input.pr,
@@ -170,6 +175,7 @@ export async function runCi(
 		out.check = await step(sb, "npm run --if-present check:cf", { cwd: WORK });
 		if (!out.check.ok) {
 			out.error = "check:cf failed";
+			await report("check", out.check);
 			return out;
 		}
 
@@ -189,6 +195,7 @@ export async function runCi(
 		);
 		if (!out.build.ok) {
 			out.error = "build failed";
+			await report("check", out.build);
 			return out;
 		}
 
@@ -206,11 +213,18 @@ export async function runCi(
 		);
 		if (!out.push.ok) {
 			out.error = "static push failed";
+			await report("check", out.push);
 			return out;
 		}
 		out.staticSha = out.push.log.match(/^[0-9a-f]{40}$/m)?.[0] ?? null;
+		await report("check", {
+			ok: true,
+			log: `check:cf ${out.check.seconds}s · build ${out.build.seconds}s · ${input.staticBranch} @ ${out.staticSha?.slice(0, 7) ?? "?"}`,
+			seconds: out.check.seconds + out.build.seconds + out.push.seconds,
+		});
 
 		out.test = await step(sb, "npm run --if-present test:cf", { cwd: WORK });
+		await report("test", out.test);
 		if (!out.test.ok) {
 			out.error = "test:cf failed";
 			return out;
@@ -237,9 +251,11 @@ export async function runCi(
 			const url = out.preview.log.match(/https:\/\/[a-z0-9.-]+\.workers\.dev/)?.[0] ?? null;
 			if (!out.preview.ok || !url) {
 				out.error = "preview deploy failed";
+				await report("preview", { ...out.preview, ok: false });
 				return out;
 			}
 			out.previewUrl = url;
+			await report("preview", out.preview, { previewUrl: url });
 
 			// The preview is live: the project's own end-to-end suite runs against
 			// it (Playwright, Browser Rendering, plain fetch — the script decides).
@@ -249,6 +265,7 @@ export async function runCi(
 				env: { PREVIEW_URL: url },
 				timeout: 15 * 60_000,
 			});
+			await report("previewTest", out.previewTest, { previewUrl: url });
 			if (!out.previewTest.ok) {
 				out.error = "test:preview:cf failed";
 				return out;

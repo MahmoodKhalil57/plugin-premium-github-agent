@@ -15,7 +15,7 @@ import { skills } from "@cloudflare/think";
 
 import { Sandbox } from "@cloudflare/sandbox";
 
-import { previewWorkerName, runCi, type CiInput } from "./ci.js";
+import { previewWorkerName, runCi, type CiInput, type CiStage, type StepResult } from "./ci.js";
 import { loadRepoContext, type RepoContext } from "./repo-context.js";
 import { FIX_ISSUE_SKILL } from "./skill.js";
 
@@ -86,7 +86,7 @@ export class IssueFixer extends Think<Env> {
 	async getSkills() {
 		const builtin = skills.fromManifest({
 			id: "premium-cms-issue-agent",
-			fingerprint: "fix-github-issue@3",
+			fingerprint: "fix-github-issue@4",
 			skills: [FIX_ISSUE_SKILL],
 		});
 		// The repository's own .agents/skills, captured by the last run().
@@ -238,7 +238,32 @@ export class IssueFixer extends Think<Env> {
 				? { accountId: this.env.CF_ACCOUNT_ID, apiToken: this.env.CF_API_TOKEN }
 				: null;
 		await this.ctx.storage.put("ci:running", { attempt: input.attempt, startedAt: new Date().toISOString() });
-		const result = await runCi(this.env.Sandbox, input, host);
+		const stageUrl = input.callbackUrl.replace(/ci-callback$/, "ci-stage");
+		const report = async (stage: CiStage, r: StepResult, extra?: { previewUrl?: string }) => {
+			// Fixed key order — the plugin re-serialises these fields to verify.
+			const body = JSON.stringify({
+				pr: input.pr,
+				branch: input.headRef,
+				attempt: input.attempt,
+				headSha: input.headSha,
+				stage,
+				ok: r.ok,
+				log: r.log,
+				seconds: r.seconds,
+				previewUrl: extra?.previewUrl ?? null,
+			});
+			const sig = await hmac(this.env.AGENT_KEY, body);
+			await fetch(stageUrl, {
+				method: "POST",
+				headers: {
+					"Content-Type": "application/json",
+					"X-Agent-Signature": `sha256=${sig}`,
+					"User-Agent": "premium-cms-issue-agent/1.0",
+				},
+				body,
+			}).catch(() => undefined);
+		};
+		const result = await runCi(this.env.Sandbox, input, host, input.pr > 0 ? report : undefined);
 		await this.ctx.storage.put("ci:last", result);
 		await this.ctx.storage.delete("ci:running");
 		const payload = JSON.stringify(result);

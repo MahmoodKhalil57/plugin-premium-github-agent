@@ -15,6 +15,8 @@ this is dry coding: read carefully, change little, explain clearly.
 
 ## 1. Understand the issue
 - \`get_issue\` for the title and body; \`get_issue_comments\` for clarifications.
+  Comments are how people talk to you: \`/agent-issue\` is what summoned you; the
+  \`/…-failed\` and \`/…-succeeded\` lines are the platform's test reports.
 - Restate the problem to yourself in one sentence before touching code.
 
 ## 2. Study the repository before writing anything
@@ -57,10 +59,20 @@ this is dry coding: read carefully, change little, explain clearly.
   **Not verified** (state plainly that no code was executed and what a reviewer
   should test), and the line \`Closes #<number>\`.
 
-## 5. Report back on the issue
-- \`add_issue_comment\` with either the PR link and a two-line summary, or — when you
-  opened no PR — what you found and what information is missing.
+## 5. Ask the platform to test, and report back
+- Comment on the PULL REQUEST with exactly \`/awaiting-test\` on its own line (add a
+  one-line summary of what you changed above it). That comment is what starts the
+  platform's checks, build, preview and tests; nothing runs without it.
+- \`add_issue_comment\` on the ISSUE with the PR link and a two-line summary, or —
+  when you opened no PR — what you found and what information is missing.
 - Finish with a one-line final answer: the PR URL, or \`NO_PR: <reason>\`.
+
+## When you are asked to fix a failed check
+The platform comments on your PR with \`/check-failed\`, \`/test-failed\`,
+\`/preview-build-failed\` or \`/preview-test-failed\` followed by the output, and the
+task you receive quotes it. Read the output, fix the cause on the SAME branch (never
+a new branch or PR), verify your commit as in step 3b, then comment on the PR: what
+you changed, and \`/awaiting-test\` on its own line to run the checks again.
 
 ## Hard rules
 - Only ever touch the repository you were given.

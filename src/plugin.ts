@@ -1,13 +1,20 @@
 /**
  * GitHub Agent — issues on the site's connected repo, and a coding agent
- * that turns labelled issues into open pull requests.
+ * driven entirely by slash-commands in issue and pull-request comments.
  *
+ *   commands  `/agent-issue` on an issue summons the agent. `/awaiting-test`
+ *             on a PR runs the platform checks. The runner answers per stage
+ *             with `/check-succeeded` | `/check-failed`, `/test-succeeded` |
+ *             `/test-failed`, `/preview-ready <url>` | `/preview-build-failed`,
+ *             `/preview-test-succeeded` | `/preview-test-failed`, `/merged`.
+ *             A `/…-failed` on the agent's own PR sends it back to fix.
+ *             Only whitelisted GitHub users' commands count.
  *   github    the site's GitHub connection (`ctx.github`) is the only
  *             credential; nothing is stored beyond the plugin's own settings.
  *   webhook   GitHub → the platform's GitHub App webhook → the parent control
  *             plane routes the event by repository → this plugin's `webhook`
- *             route. The issue is re-read from GitHub before anything happens,
- *             so the event is only ever a hint.
+ *             route. Issues and PRs are re-read from GitHub before anything
+ *             happens, so the event is only ever a hint.
  *   agent     a Cloudflare Worker running a Think agent (Workers AI +
  *             GitHub MCP). It reads the repo, writes a branch, opens a PR and
  *             leaves it open, then calls back (`agent-callback`, HMAC-signed).
@@ -21,6 +28,7 @@ import type { PluginContext, SandboxedPlugin } from "@premium-cms/emdash/plugin"
 import {
 	canonicalCallback,
 	canonicalCi,
+	canonicalStage,
 	ciStatus,
 	deletePreview,
 	dispatch,
@@ -32,10 +40,10 @@ import {
 	timingSafeEqual,
 	type Callback,
 	type CiResult,
+	type CiStageReport,
 	type Run,
 } from "./agent.js";
 import {
-	addLabels,
 	branchHead,
 	comment,
 	createIssue,
@@ -54,6 +62,34 @@ import { DEFAULTS, normalizeLogin, readSettings, saveSettings, type Settings } f
 
 const CALLBACK_PATH = "/_emdash/api/plugins/premium-github-agent/agent-callback";
 const CI_CALLBACK_PATH = "/_emdash/api/plugins/premium-github-agent/ci-callback";
+
+/** The comment vocabulary. Anything else in a comment is just text. */
+const COMMANDS = [
+	"agent-issue",
+	"awaiting-test",
+	"check-succeeded",
+	"check-failed",
+	"test-succeeded",
+	"test-failed",
+	"preview-ready",
+	"preview-build-failed",
+	"preview-test-succeeded",
+	"preview-test-failed",
+	"merged",
+] as const;
+type Command = (typeof COMMANDS)[number];
+const FAILURE_COMMANDS: Command[] = ["check-failed", "test-failed", "preview-build-failed", "preview-test-failed"];
+const COMMAND_RE = new RegExp(`(?:^|\\s)/(${COMMANDS.join("|")})(?=\\s|$)`, "g");
+
+/** Every command mentioned in a comment body, in order, deduplicated. */
+function commandsIn(body: string): Command[] {
+	const out: Command[] = [];
+	for (const m of body.matchAll(COMMAND_RE)) {
+		const c = m[1] as Command;
+		if (!out.includes(c)) out.push(c);
+	}
+	return out;
+}
 const STATUS_CONTEXT = "premium-cms/ci";
 /** A build still "running" after this long lost its callback; a new one may start. */
 const STALE_BUILD_MS = 30 * 60 * 1000;
@@ -135,7 +171,7 @@ async function runIssue(
 	const existing = await getRun(ctx, issue.number);
 	if (existing && (existing.status === "queued" || existing.status === "running")) return existing;
 	if (existing?.status === "completed" && !again) return existing;
-	const attempt = again ? (existing?.attempt ?? 1) + 1 : (existing?.attempt ?? 1);
+	const attempt = existing ? (again ? (existing.attempt ?? 1) + 1 : (existing.attempt ?? 1)) : 1;
 
 	const base = { number: issue.number, title: issue.title, author: issue.author, attempt, updatedAt: now() };
 	if (!allowed(settings, issue.author)) {
@@ -185,18 +221,12 @@ function applyOutcome(run: Run, status: string, answer: string | null): Run {
 	return run;
 }
 
-/** Manual reconcile: dispatch labelled issues not seen yet, refresh in-flight runs. */
+/** Manual reconcile: refresh in-flight runs and builds from the worker. */
 async function poll(ctx: PluginContext): Promise<{ dispatched: number; refreshed: number; error?: string }> {
 	const setup = await requireSetup(ctx);
 	if (!setup.ok) return { dispatched: 0, refreshed: 0, error: setup.error };
 	const { conn, settings } = setup;
-
-	let dispatched = 0;
-	for (const issue of await listIssues(ctx, conn, { label: settings.label, limit: 30 })) {
-		if (await getRun(ctx, issue.number)) continue;
-		const run = await runIssue(ctx, settings, conn, issue);
-		if (run.status === "queued") dispatched++;
-	}
+	const dispatched = 0;
 
 	let refreshed = 0;
 	for (const run of await listRuns(ctx, 50)) {
@@ -315,27 +345,27 @@ function firstFailure(r: CiResult): { name: string; log: string } | null {
 	return null;
 }
 
-function ciComment(conn: Connection, b: Build, r: CiResult, next: string): string {
-	const failure = firstFailure(r);
-	const staticUrl = `https://github.com/${conn.owner}/${conn.repo}/tree/${r.staticBranch}`;
-	return [
-		`### ${r.ok ? "✅" : "❌"} PremiumCMS CI — attempt ${r.attempt} on \`${b.headRef}\` @ ${r.headSha.slice(0, 7)}`,
-		"",
-		stepLine("check:cf", r.check),
-		stepLine("build (astro)", r.build),
-		stepLine(`static build → [\`${r.staticBranch}\`](${staticUrl})`, r.push),
-		stepLine("test:cf", r.test),
-		...(r.preview ? [stepLine("preview on Cloudflare", r.preview)] : []),
-		...(r.previewTest ? [stepLine("test:preview:cf (against the preview)", r.previewTest)] : []),
-		...(r.previewUrl ? ["", `**Preview:** ${r.previewUrl}`] : []),
-		...(r.staticSha ? ["", `Static build commit: ${r.staticSha.slice(0, 7)} (force-pushed; the branch always holds the latest build of this PR).`] : []),
-		...(failure
-			? ["", `<details><summary>${failure.name} output</summary>`, "", "```", failure.log.trim().slice(-5000), "```", "", "</details>"]
-			: []),
-		...(r.error && !failure ? ["", `Error: ${r.error}`] : []),
-		"",
-		next,
-	].join("\n");
+function stageComment(r: CiStageReport): string {
+	const head = `\`${r.branch}\` @ ${r.headSha.slice(0, 7)}, attempt ${r.attempt}`;
+	const detail = r.log.trim() ? ["", "<details><summary>output</summary>", "", "```", r.log.trim().slice(-5000), "```", "", "</details>"] : [];
+	switch (r.stage) {
+		case "check":
+			return r.ok
+				? [`/check-succeeded`, `check:cf and build passed — ${head} (${r.seconds}s). ${r.log.trim()}`].join("\n")
+				: [`/check-failed`, `check or build failed — ${head} (${r.seconds}s).`, ...detail].join("\n");
+		case "test":
+			return r.ok
+				? [`/test-succeeded`, `test:cf passed — ${head} (${r.seconds}s).`].join("\n")
+				: [`/test-failed`, `test:cf failed — ${head} (${r.seconds}s).`, ...detail].join("\n");
+		case "preview":
+			return r.ok && r.previewUrl
+				? [`/preview-ready ${r.previewUrl}`, `Preview of ${head} is live at ${r.previewUrl} (${r.seconds}s).`].join("\n")
+				: [`/preview-build-failed`, `Hosting the preview failed — ${head} (${r.seconds}s).`, ...detail].join("\n");
+		case "previewTest":
+			return r.ok
+				? [`/preview-test-succeeded`, `test:preview:cf passed against ${r.previewUrl ?? "the preview"} — ${head} (${r.seconds}s).`].join("\n")
+				: [`/preview-test-failed`, `test:preview:cf failed against ${r.previewUrl ?? "the preview"} — ${head} (${r.seconds}s).`, ...detail].join("\n");
+	}
 }
 
 /**
@@ -407,10 +437,10 @@ async function buildPull(
 }
 
 /**
- * Apply a CI result: store it, comment on the PR, set the commit status and —
- * when the PR is the agent's own fix branch and the run failed — ask the
- * agent to push a fix (which GitHub reports as `synchronize`, re-running CI
- * onto the same static branch) until `maxBuildAttempts` is used up.
+ * Apply a finished run: store it, set the commit status, merge when green
+ * (`/merged`). Per-stage `/…-succeeded` / `/…-failed` comments were already
+ * posted by `ci-stage`; a failure comment on an agent PR is what sends the
+ * agent back (see the `issue_comment` handling), bounded by `maxBuildAttempts`.
  * Idempotent per (pr, attempt).
  */
 async function recordCi(ctx: PluginContext, settings: Settings, conn: Connection, r: CiResult): Promise<Build | null> {
@@ -418,8 +448,6 @@ async function recordCi(ctx: PluginContext, settings: Settings, conn: Connection
 	if (!build) return null;
 	if (build.attempt !== r.attempt || build.status !== "running") return build;
 
-	const exhausted = r.attempt >= settings.maxBuildAttempts;
-	const agentPr = build.issue !== undefined;
 	let next: Build = {
 		...build,
 		status: r.ok ? "passed" : "failed",
@@ -427,29 +455,19 @@ async function recordCi(ctx: PluginContext, settings: Settings, conn: Connection
 		previewUrl: r.previewUrl ?? build.previewUrl,
 		summary: r.ok ? `passed on attempt ${r.attempt}` : (firstFailure(r)?.name ?? r.error ?? "failed"),
 	};
-	let closing: string;
-	if (r.ok) {
-		closing = [
-			r.previewUrl ? `Preview: ${r.previewUrl}. The static build lives on \`${r.staticBranch}\`.` : `The static build lives on \`${r.staticBranch}\`.`,
-			settings.autoMerge ? `All checks passed — merging into \`${conn.branch}\`, which rebuilds \`${staticBranchFor(conn.branch)}\`.` : "Ready for review.",
-		].join(" ");
-	} else if (agentPr && !exhausted) {
-		closing = `The agent will push a fix to \`${build.headRef}\` (build attempt ${r.attempt + 1} of ${settings.maxBuildAttempts}).`;
-	} else if (agentPr) {
-		closing = `Build attempts exhausted (${settings.maxBuildAttempts}); a human needs to take it from here.`;
-		next = { ...next, status: "capped" };
-	} else {
-		closing = "Push a fix to re-run the checks.";
-	}
+	if (!r.ok && build.issue !== undefined && r.attempt >= settings.maxBuildAttempts) next = { ...next, status: "capped" };
 	await putBuild(ctx, next);
 
-	await comment(ctx, conn, r.pr, ciComment(conn, next, r, closing)).catch((e) => ctx.log.warn("PR comment failed", e));
 	await setStatus(ctx, conn, r.headSha, {
 		state: r.ok ? "success" : "failure",
 		context: STATUS_CONTEXT,
 		description: r.ok ? `passed (attempt ${r.attempt}); static: ${r.staticBranch}` : `${next.summary} (attempt ${r.attempt})`,
 		targetUrl: r.previewUrl ?? `https://github.com/${conn.owner}/${conn.repo}/pull/${r.pr}`,
 	}).catch(() => undefined);
+
+	if (next.status === "capped") {
+		await comment(ctx, conn, r.pr, `Build attempts exhausted (${settings.maxBuildAttempts}); a human needs to take it from here.`).catch(() => undefined);
+	}
 
 	if (r.ok && settings.autoMerge) {
 		const m: { merged: boolean; sha?: string; message: string } = await mergePull(ctx, conn, r.pr, build.title).catch(
@@ -458,31 +476,42 @@ async function recordCi(ctx: PluginContext, settings: Settings, conn: Connection
 		if (m.merged) {
 			next = { ...next, status: "merged", summary: `merged into ${conn.branch}${m.sha ? ` @ ${m.sha.slice(0, 7)}` : ""}` };
 			await putBuild(ctx, next);
+			await comment(ctx, conn, r.pr, [`/merged`, `Every check passed — squash-merged into \`${conn.branch}\`${m.sha ? ` (${m.sha.slice(0, 7)})` : ""}; \`${staticBranchFor(conn.branch)}\` rebuilds from it.`].join("\n")).catch(() => undefined);
 			ctx.log.info(`PR #${r.pr} merged into ${conn.branch}`, { sha: m.sha });
 		} else {
 			await comment(ctx, conn, r.pr, `Could not merge automatically: ${m.message}. The PR stays open for a human.`).catch(() => undefined);
 			ctx.log.warn(`PR #${r.pr}: auto-merge refused: ${m.message}`);
 		}
 	}
-
-	if (!r.ok && agentPr && !exhausted && build.issue !== undefined) {
-		const failure = firstFailure(r);
-		const note = [
-			`CI failed on your pull request #${r.pr} (branch \`${build.headRef}\`, commit ${r.headSha.slice(0, 7)}) at step "${failure?.name ?? r.error ?? "unknown"}".`,
-			"Fix the cause and push the corrected files to that same branch (do not open another PR or branch). Then comment on the PR with what you changed.",
-			"",
-			"Output:",
-			"```",
-			(failure?.log ?? r.error ?? "").trim().slice(-6000),
-			"```",
-		].join("\n");
-		const issue = await getIssue(ctx, conn, build.issue);
-		if (issue) {
-			const run = await runIssue(ctx, settings, conn, issue, true, note);
-			ctx.log.info(`PR #${r.pr}: agent asked to fix (attempt ${run.attempt})`);
-		}
-	}
 	return next;
+}
+
+/** A `/…-failed` report on the agent's own PR: hand the output back to the agent, if attempts remain. */
+async function agentFix(
+	ctx: PluginContext,
+	settings: Settings,
+	conn: Connection,
+	pr: PullRequest,
+	command: Command,
+	body: string,
+): Promise<{ started: boolean; reason?: string }> {
+	const issueNo = Number(pr.headRef.match(AGENT_BRANCH)?.[1]);
+	if (!Number.isInteger(issueNo)) return { started: false, reason: "not an agent branch" };
+	const build = await getBuild(ctx, pr.number);
+	if (build && build.attempt >= settings.maxBuildAttempts) {
+		return { started: false, reason: `reached ${settings.maxBuildAttempts} build attempts` };
+	}
+	const issue = await getIssue(ctx, conn, issueNo);
+	if (!issue) return { started: false, reason: `issue #${issueNo} not found` };
+	const note = [
+		`The platform reported \`/${command}\` on your pull request #${pr.number} (branch \`${pr.headRef}\`, commit ${pr.headSha.slice(0, 7)}):`,
+		"",
+		body.trim().slice(-8000),
+		"",
+		"Fix the cause and push the corrected files to that same branch (no new branch or PR). Then comment on the PR with what you changed and `/awaiting-test` on its own line.",
+	].join("\n");
+	const run = await runIssue(ctx, settings, conn, issue, true, note);
+	return { started: run.status === "queued", reason: run.reason };
 }
 
 /**
@@ -568,6 +597,32 @@ async function recordBranchCi(ctx: PluginContext, settings: Settings, conn: Conn
 	return next;
 }
 
+/** A command-bearing event: a freshly opened issue whose body has one, or a new comment. */
+function commandEvent(
+	input: Record<string, unknown>,
+): { number: number; isPull: boolean; author: string; body: string; commands: Command[] } | null {
+	const issue = isRecord(input.issue) ? input.issue : null;
+	if (!issue) return null;
+	const number = Number(issue.number);
+	if (!Number.isInteger(number) || number <= 0) return null;
+	const isPull = isRecord(issue.pull_request);
+	const commentObj = isRecord(input.comment) ? input.comment : null;
+	if (commentObj) {
+		if (input.action !== "created") return null;
+		const body = String(commentObj.body ?? "");
+		const commands = commandsIn(body);
+		if (!commands.length) return null;
+		const user = isRecord(commentObj.user) ? commentObj.user : {};
+		return { number, isPull, author: String(user.login ?? ""), body, commands };
+	}
+	if (input.action !== "opened" || isPull) return null;
+	const body = String(issue.body ?? "");
+	const commands = commandsIn(body).filter((c) => c === "agent-issue");
+	if (!commands.length) return null;
+	const user = isRecord(issue.user) ? issue.user : {};
+	return { number, isPull, author: String(user.login ?? ""), body, commands };
+}
+
 function pushFromEvent(input: unknown): { branch: string; after: string; deleted: boolean } | null {
 	if (!isRecord(input) || typeof input.ref !== "string" || !input.ref.startsWith("refs/heads/")) return null;
 	return { branch: input.ref.slice("refs/heads/".length), after: String(input.after ?? ""), deleted: input.deleted === true };
@@ -613,7 +668,10 @@ const plugin: SandboxedPlugin = {
 		 */
 		webhook: {
 			handler: async (routeCtx, ctx) => {
-				const push = pushFromEvent(routeCtx.input);
+				const input = isRecord(routeCtx.input) ? routeCtx.input : {};
+
+				// Pushes to the default branch rebuild the site.
+				const push = pushFromEvent(input);
 				if (push) {
 					const setup = await requireSetup(ctx);
 					if (!setup.ok) return { success: false, error: setup.error };
@@ -624,53 +682,89 @@ const plugin: SandboxedPlugin = {
 					const r = await buildDefaultBranch(ctx, setup.settings, setup.conn, `push ${push.after.slice(0, 7)}`);
 					return { success: true, branch: push.branch, started: r.started, reason: r.reason };
 				}
-				const pull = pullFromEvent(routeCtx.input);
+
+				// Closed PRs: drop the preview. Nothing else about PRs is implicit.
+				const pull = pullFromEvent(input);
 				if (pull) {
+					if (pull.action !== "closed") return { success: true, ignored: `pull_request ${pull.action}` };
 					const setup = await requireSetup(ctx);
 					if (!setup.ok) return { success: false, error: setup.error };
-					if (pull.action === "closed") {
-						const build = await getBuild(ctx, pull.number);
-						if (build) {
-							const deleted = build.previewUrl
-								? await deletePreview(ctx, setup.settings, setup.conn, pull.number).catch(() => false)
-								: false;
-							await putBuild(ctx, {
-								...build,
-								status: build.status === "merged" ? "merged" : "closed",
-								previewUrl: undefined,
-								summary: `${build.status === "merged" ? build.summary : "closed"}; preview ${deleted ? "removed" : "not removed"}`,
-							});
-						}
-						return { success: true, pr: pull.number, closed: true };
+					const build = await getBuild(ctx, pull.number);
+					if (build) {
+						const deleted = build.previewUrl
+							? await deletePreview(ctx, setup.settings, setup.conn, pull.number).catch(() => false)
+							: false;
+						await putBuild(ctx, {
+							...build,
+							status: build.status === "merged" ? "merged" : "closed",
+							previewUrl: undefined,
+							summary: `${build.status === "merged" ? build.summary : "closed"}; preview ${deleted ? "removed" : "not removed"}`,
+						});
 					}
-					if (!["opened", "synchronize", "reopened", "ready_for_review"].includes(pull.action)) {
-						return { success: true, ignored: `action ${pull.action}` };
-					}
-					if (!setup.settings.enabled) return { success: true, ignored: "disabled" };
-					const pr = await getPull(ctx, setup.conn, pull.number);
-					if (!pr) return { success: true, ignored: "pull request not found" };
-					if (pr.draft) return { success: true, ignored: "draft" };
-					const r = await buildPull(ctx, setup.settings, setup.conn, pr);
-					return { success: true, pr: pr.number, started: r.started, reason: r.reason, status: r.build?.status };
+					return { success: true, pr: pull.number, closed: true };
 				}
-				const ev = issueNumberFromEvent(routeCtx.input);
-				if (!ev) return { success: true, ignored: "not an issue event" };
-				if (!["opened", "labeled", "reopened"].includes(ev.action)) {
-					return { success: true, ignored: `action ${ev.action}` };
-				}
+
+				// Commands: a new issue whose body carries one, or a new comment.
+				const cmd = commandEvent(input);
+				if (!cmd) return { success: true, ignored: "no command" };
 				const setup = await requireSetup(ctx);
 				if (!setup.ok) return { success: false, error: setup.error };
 				if (!setup.settings.enabled) return { success: true, ignored: "disabled" };
-				if (ev.action === "labeled" && ev.label && ev.label !== setup.settings.label) {
-					return { success: true, ignored: `label ${ev.label}` };
+				if (!allowed(setup.settings, cmd.author)) return { success: true, ignored: `@${cmd.author} is not whitelisted` };
+				const handled: Record<string, unknown> = {};
+
+				for (const command of cmd.commands) {
+					if (command === "agent-issue" && !cmd.isPull) {
+						const issue = await getIssue(ctx, setup.conn, cmd.number);
+						if (!issue) return { success: true, ignored: "issue not found" };
+						const run = await runIssue(ctx, setup.settings, setup.conn, issue, true);
+						handled[command] = { status: run.status, attempt: run.attempt, reason: run.reason };
+					} else if (command === "awaiting-test" && cmd.isPull) {
+						const pr = await getPull(ctx, setup.conn, cmd.number);
+						if (!pr) return { success: true, ignored: "pull request not found" };
+						const r = await buildPull(ctx, setup.settings, setup.conn, pr);
+						handled[command] = { started: r.started, reason: r.reason, attempt: r.build?.attempt };
+					} else if (FAILURE_COMMANDS.includes(command) && cmd.isPull) {
+						const pr = await getPull(ctx, setup.conn, cmd.number);
+						if (!pr || pr.state !== "open") return { success: true, ignored: "pull request not open" };
+						handled[command] = await agentFix(ctx, setup.settings, setup.conn, pr, command, cmd.body);
+					}
 				}
-				const issue = await getIssue(ctx, setup.conn, ev.number);
-				if (!issue) return { success: true, ignored: "issue not found" };
-				if (!issue.labels.includes(setup.settings.label)) {
-					return { success: true, ignored: "trigger label not present" };
+				return { success: true, number: cmd.number, handled };
+			},
+		},
+
+		/** A per-stage report from the worker while a PR build runs: one `/…` comment each. */
+		"ci-stage": {
+			public: true,
+			handler: async (routeCtx, ctx) => {
+				const input = isRecord(routeCtx.input) ? routeCtx.input : {};
+				const settings = await readSettings(ctx);
+				const given = headerOf(routeCtx.request, "X-Agent-Signature").replace(/^sha256=/, "");
+				if (!settings.agentKey || !given) return { success: false, error: "unsigned" };
+				const r: CiStageReport = {
+					pr: Number(input.pr),
+					branch: String(input.branch ?? ""),
+					attempt: Number(input.attempt),
+					headSha: String(input.headSha ?? ""),
+					stage: input.stage as CiStageReport["stage"],
+					ok: input.ok === true,
+					log: typeof input.log === "string" ? input.log : "",
+					seconds: Number(input.seconds) || 0,
+					previewUrl: typeof input.previewUrl === "string" ? input.previewUrl : null,
+				};
+				const expected = await hmacHex(settings.agentKey, canonicalStage(r));
+				if (!timingSafeEqual(given, expected)) return { success: false, error: "bad signature" };
+				if (!["check", "test", "preview", "previewTest"].includes(r.stage) || !(r.pr > 0)) {
+					return { success: true, ignored: "not a PR stage" };
 				}
-				const run = await runIssue(ctx, setup.settings, setup.conn, issue);
-				return { success: true, run: { number: run.number, status: run.status, reason: run.reason } };
+				const conn = await getConnection(ctx);
+				if (!conn) return { success: false, error: "GitHub not connected" };
+				const build = await getBuild(ctx, r.pr);
+				if (!build || build.attempt !== r.attempt) return { success: true, ignored: "stale stage" };
+				if (r.stage === "preview" && r.ok && r.previewUrl) await putBuild(ctx, { ...build, previewUrl: r.previewUrl });
+				await comment(ctx, conn, r.pr, stageComment(r));
+				return { success: true, stage: r.stage, ok: r.ok };
 			},
 		},
 
@@ -782,10 +876,10 @@ const plugin: SandboxedPlugin = {
 				const title = typeof input.title === "string" ? input.title.trim() : "";
 				if (!title) return { success: false, error: "A title is required." };
 				const labels = Array.isArray(input.labels) ? input.labels.map(String) : [];
-				if (input.agent === true && !labels.includes(setup.settings.label)) labels.push(setup.settings.label);
+				const text = typeof input.body === "string" ? input.body : "";
 				const issue = await createIssue(ctx, setup.conn, {
 					title,
-					body: typeof input.body === "string" ? input.body : "",
+					body: input.agent === true && !commandsIn(text).includes("agent-issue") ? `${text.trimEnd()}\n\n/agent-issue` : text,
 					labels,
 				});
 				return { success: true, issue };
@@ -802,9 +896,6 @@ const plugin: SandboxedPlugin = {
 				if (!Number.isInteger(number) || number <= 0) return { success: false, error: "Issue number required." };
 				const issue = await getIssue(ctx, setup.conn, number);
 				if (!issue) return { success: false, error: `Issue #${number} not found.` };
-				if (!issue.labels.includes(setup.settings.label)) {
-					await addLabels(ctx, setup.conn, number, [setup.settings.label]);
-				}
 				const run = await runIssue(ctx, setup.settings, setup.conn, issue, input.again === true);
 				return { success: run.status !== "error" && run.status !== "skipped", run };
 			},
@@ -867,16 +958,16 @@ const plugin: SandboxedPlugin = {
 					const v = i.values ?? {};
 					const title = typeof v.title === "string" ? v.title.trim() : "";
 					if (!title) return buildPage(ctx, "A title is required.");
-					const labels = v.agent === true ? [setup.settings.label] : [];
+					const text = typeof v.body === "string" ? v.body : "";
 					try {
 						const issue = await createIssue(ctx, setup.conn, {
 							title,
-							body: typeof v.body === "string" ? v.body : "",
-							labels,
+							body: v.agent === true ? `${text.trimEnd()}\n\n/agent-issue` : text,
+							labels: [],
 						});
 						return buildPage(
 							ctx,
-							`Issue #${issue.number} created${labels.length ? " — the agent starts as soon as GitHub delivers the event" : ""}.`,
+							`Issue #${issue.number} created${v.agent === true ? " — the agent starts as soon as GitHub delivers the event" : ""}.`,
 						);
 					} catch (error) {
 						return buildPage(ctx, String(error));
@@ -888,9 +979,6 @@ const plugin: SandboxedPlugin = {
 					const number = Number(i.values?.number);
 					const issue = Number.isInteger(number) && number > 0 ? await getIssue(ctx, setup.conn, number) : null;
 					if (!issue) return buildPage(ctx, `Issue #${number} not found.`);
-					if (!issue.labels.includes(setup.settings.label)) {
-						await addLabels(ctx, setup.conn, number, [setup.settings.label]).catch(() => undefined);
-					}
 					const run = await runIssue(ctx, setup.settings, setup.conn, issue, i.values?.again === true);
 					return buildPage(
 						ctx,
@@ -953,7 +1041,7 @@ async function buildPage(ctx: PluginContext, notice?: string) {
 	} else {
 		blocks.push({
 			type: "context",
-			text: `Repository ${conn.owner}/${conn.repo} (${conn.branch}). Issues labelled "${settings.label}" by whitelisted users are handed to the agent the moment GitHub reports them${settings.enabled ? "" : " — currently OFF"}.`,
+			text: `Repository ${conn.owner}/${conn.repo} (${conn.branch}). Whitelisted users drive the agent with comments: /agent-issue on an issue, /awaiting-test on a pull request; the runner answers with /check-…, /test-…, /preview-ready, /preview-test-… and /merged${settings.enabled ? "" : " — currently OFF"}.`,
 		});
 		if (settings.allowedUsers.length === 0) {
 			blocks.push({
@@ -1029,7 +1117,7 @@ async function buildPage(ctx: PluginContext, notice?: string) {
 					title: i.title,
 					author: `${i.author}${allowed(settings, i.author) ? "" : " (not whitelisted)"}`,
 					labels: i.labels.join(", ") || "-",
-					agent: run ? STATUS_LABEL[run.status] : i.labels.includes(settings.label) ? "pending" : "-",
+					agent: run ? STATUS_LABEL[run.status] : "-",
 					result: run?.prUrl ?? run?.reason ?? run?.answer ?? "",
 					created: i.createdAt,
 				};
@@ -1037,7 +1125,7 @@ async function buildPage(ctx: PluginContext, notice?: string) {
 		});
 		const builds = await listBuilds(ctx, 30);
 		blocks.push({ type: "divider" });
-		blocks.push({ type: "section", text: "Pull requests built by the platform (check:cf → build → static branch → test:cf → Cloudflare preview → test:preview:cf)." });
+		blocks.push({ type: "section", text: "Pull requests built by the platform after /awaiting-test (check:cf → build → static branch → test:cf → Cloudflare preview → test:preview:cf → /merged)." });
 		blocks.push({
 			type: "table",
 			block_id: "pulls",
@@ -1086,7 +1174,7 @@ async function buildPage(ctx: PluginContext, notice?: string) {
 					type: "toggle",
 					action_id: "agent",
 					label: "Hand to the agent",
-					description: `Adds the "${settings.label}" label.`,
+					description: "Ends the issue body with /agent-issue.",
 					initial_value: true,
 				},
 			],
@@ -1108,8 +1196,7 @@ async function buildPage(ctx: PluginContext, notice?: string) {
 		type: "form",
 		block_id: "settings",
 		fields: [
-			{ type: "toggle", action_id: "enabled", label: "React to labelled issues", initial_value: settings.enabled },
-			{ type: "text_input", action_id: "label", label: "Trigger label", initial_value: settings.label },
+			{ type: "toggle", action_id: "enabled", label: "React to /commands", initial_value: settings.enabled },
 			{
 				type: "text_input",
 				action_id: "allowedUsers",

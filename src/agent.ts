@@ -112,6 +112,34 @@ export function canonicalCi(r: CiResult): string {
 	});
 }
 
+/** A stage report the worker POSTs to `ci-stage` while a run progresses. */
+export interface CiStageReport {
+	pr: number;
+	branch: string;
+	attempt: number;
+	headSha: string;
+	stage: "check" | "test" | "preview" | "previewTest";
+	ok: boolean;
+	log: string;
+	seconds: number;
+	previewUrl: string | null;
+}
+
+/** Fixed field order — what the worker signs for a stage report. */
+export function canonicalStage(r: CiStageReport): string {
+	return JSON.stringify({
+		pr: r.pr,
+		branch: r.branch,
+		attempt: r.attempt,
+		headSha: r.headSha,
+		stage: r.stage,
+		ok: r.ok,
+		log: r.log,
+		seconds: r.seconds,
+		previewUrl: r.previewUrl,
+	});
+}
+
 /** Remove a PR's preview Worker (best-effort, when the PR closes). */
 export async function deletePreview(ctx: PluginContext, settings: Settings, conn: Connection, pr: number): Promise<boolean> {
 	const q = new URLSearchParams({ owner: conn.owner, repo: conn.repo, pr: String(pr) });

@@ -15,20 +15,32 @@ labelled issues into **open** pull requests.
   listed in the plugin settings. Everyone else's labelled issues are recorded as
   skipped.
 
-## How it works
+## How it works — a comment protocol
 
-1. GitHub delivers `issues` events to the platform's GitHub App webhook. The
-   parent control plane (projects plugin, `githubWebhook` route) routes each
-   event to the project whose site repo it belongs to and calls this plugin's
-   `webhook` route. Nothing is polled.
-2. The plugin re-reads the issue from GitHub with the site's own token: if it
-   carries the trigger label (default `agent`) and its author is whitelisted,
-   the agent worker is asked to run (`POST /run`, idempotent per issue+attempt).
-3. When the run ends the worker calls `agent-callback` (HMAC-signed with the
-   agent key) with the outcome; the PR link shows up on the admin page.
-4. The admin page (**GitHub Agent**) lists issues, creates new ones (optionally
-   labelled for the agent), runs the agent on a given issue ("run again" retries
-   a finished one as a new attempt), reconciles by hand, and holds the settings.
+Everything is driven by `/commands` in issue and pull-request comments, from
+**whitelisted GitHub users** only (the plugin setting). There is no label.
+
+| Who      | Command                                    | Effect |
+| -------- | ------------------------------------------ | ------ |
+| you      | `/agent-issue` (issue body or comment)     | the agent studies the repo, opens a fix PR, and comments `/awaiting-test` on it |
+| you/agent| `/awaiting-test` (PR comment)              | the platform runs the checks on the PR head |
+| runner   | `/check-succeeded` · `/check-failed`       | `check:cf` + `astro build` + push to `static/<branch>` |
+| runner   | `/test-succeeded` · `/test-failed`         | `test:cf` |
+| runner   | `/preview-ready <url>` · `/preview-build-failed` | the build hosted on Cloudflare |
+| runner   | `/preview-test-succeeded` · `/preview-test-failed` | `test:preview:cf` against the preview |
+| runner   | `/merged`                                  | squash-merged into the default branch (Auto-merge setting) |
+
+A `/…-failed` report on the agent's own PR (`agent/issue-N-…`) sends the output
+back to the agent, which pushes a fix to the same branch and comments
+`/awaiting-test` again — bounded by **Max build attempts per PR**. Reports on a
+human's PR are informational; `/…-succeeded` never triggers anything. Pushes
+to the default branch and content publishes rebuild `static/<default>` without
+any comment.
+
+GitHub → App webhook → parent control plane (`githubWebhook`, routed by
+repository) → this plugin's `webhook` route; issues and PRs are re-read from
+GitHub before anything happens. The App must subscribe to **Issues**,
+**Issue comment**, **Pull request** and **Push** events.
 
 ## Pull requests: check → build → static branch → test
 
