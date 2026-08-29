@@ -356,6 +356,8 @@ interface Build {
 	baseRef?: string;
 	/** The stack this PR is a layer of. */
 	stack?: string;
+	/** The stack merge was announced on this PR (`/merged`, issue closed) — set only by the announcer, so a `closed` webhook racing it cannot suppress the comment. */
+	announced?: boolean;
 	/** Branch builds: another build was requested while this one ran. */
 	rebuild?: boolean;
 	/** Branch builds: the deployments before the live one (`-b-1`, `-b-2`) and their preview Workers. */
@@ -1127,8 +1129,8 @@ async function completeStackMerge(
 ): Promise<Stack> {
 	for (const pr of prs) {
 		const b = await getBuild(ctx, pr);
-		if (b?.status === "merged") continue;
-		if (b) await putBuild(ctx, { ...b, status: "merged", summary: `merged into ${conn.branch} with the stack${sha ? ` @ ${sha.slice(0, 7)}` : ""}` });
+		if (b?.announced) continue;
+		if (b) await putBuild(ctx, { ...b, status: "merged", announced: true, summary: `merged into ${conn.branch} with the stack${sha ? ` @ ${sha.slice(0, 7)}` : ""}` });
 		await comment(
 			ctx,
 			conn,
@@ -1441,6 +1443,13 @@ const plugin: SandboxedPlugin = {
 					if (pull.action !== "closed") return { success: true, ignored: `pull_request ${pull.action}` };
 					const setup = await requireSetup(ctx);
 					if (!setup.ok) return { success: false, error: setup.error };
+					// A layer of a stack landed (our merge, or someone's): announce it
+					// first — this event can arrive before our own merge bookkeeping.
+					const stack = await stackWithPull(ctx, pull.number);
+					if (stack && pull.merged) {
+						const layers = await stackLayers(ctx, setup.conn, stack);
+						await completeStackMerge(ctx, setup.settings, setup.conn, stack, layers, [pull.number], undefined);
+					}
 					const build = await getBuild(ctx, pull.number);
 					const merged = build?.status === "merged" || pull.merged;
 					if (build) {
@@ -1454,16 +1463,8 @@ const plugin: SandboxedPlugin = {
 							summary: `${build.status === "merged" ? build.summary : merged ? `merged into ${setup.conn.branch}` : "closed"}; preview ${deleted ? "removed" : "not removed"}`,
 						});
 					}
-					// A layer of a stack landed (our merge, or someone's) or was closed: let the stack catch up.
-					const stack = await stackWithPull(ctx, pull.number);
-					if (stack) {
-						if (pull.merged && build?.status !== "merged") {
-							const layers = await stackLayers(ctx, setup.conn, stack);
-							await completeStackMerge(ctx, setup.settings, setup.conn, stack, layers, [pull.number], undefined);
-						} else {
-							await settleStack(ctx, setup.settings, setup.conn, stack);
-						}
-					}
+					// A layer closed without merging blocks the layers above: let the stack take note.
+					if (stack && !pull.merged) await settleStack(ctx, setup.settings, setup.conn, stack);
 					return { success: true, pr: pull.number, closed: true, merged };
 				}
 

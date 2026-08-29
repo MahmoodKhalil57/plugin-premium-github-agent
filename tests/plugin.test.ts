@@ -629,6 +629,41 @@ describe("/agent-stack", () => {
 		expect(stacks.get(stack.id)).toMatchObject({ status: "merged" });
 	});
 
+	it("announces a merged layer exactly once, whichever arrives first — our merge bookkeeping or GitHub's closed webhook", async () => {
+		const gh = fakeGitHub({ issues: { 1: issue(1, "alice"), 2: issue(2, "alice") }, pulls: { 10: spull(10, "b1"), 11: spull(11, "b2", "b1") } });
+		gh.state.stacks.push({ number: 70, open: true, base: { ref: "main" }, pull_requests: [10, 11].map((n) => ({ number: n, state: "open", draft: false, merged_at: null, head: gh.state.pulls[n].head })) });
+		const { ctx, store, builds, stacks, calls } = ctxWith({ github: conn, settings, fetch: gh.fetch });
+		stacks.set("s1-t", { id: "s1-t", issues: [1, 2], prs: { "1": 10, "2": 11 }, github: 70, status: "running", createdBy: "alice", createdAt: "2026-01-01T00:00:00Z", updatedAt: "2026-01-01T00:00:00Z" });
+		for (const [n, pr] of [[1, 10], [2, 11]] as const) {
+			store.set(String(n), { number: n, title: `Issue ${n}`, author: "alice", status: "completed", prUrl: `https://github.com/acme/site/pull/${pr}`, attempt: 1, stack: "s1-t", layer: n, updatedAt: "2026-01-01T00:00:00Z" });
+		}
+		builds.set("10", { pr: 10, title: "PR 10", author: "alice", headRef: "b1", headSha: "abc1234", staticBranch: "static/b1", attempt: 1, status: "passed", issue: 1, stack: "s1-t", updatedAt: "2026-01-01T00:00:00Z" });
+		builds.set("11", { pr: 11, title: "PR 11", author: "alice", headRef: "b2", headSha: "abc1234", staticBranch: "static/b2", attempt: 1, status: "running", issue: 2, stack: "s1-t", updatedAt: "2026-01-01T00:00:00Z" });
+		// The top layer goes green: the stack merges; GitHub's closed webhooks follow (here: after, and once more as a duplicate delivery).
+		await route("ci-callback")(await signed({ ...ciResult(11, 1, true), branch: "b2" }, canonicalCi), ctx);
+		expect(gh.state.merges.map((m) => m.pr)).toEqual([11]);
+		for (const pr of [10, 11, 10]) {
+			await route("webhook")({ input: { action: "closed", pull_request: gh.state.pulls[pr], repository: { full_name: "acme/site" } } }, ctx);
+		}
+		expect(commentsPosted(calls, 10).filter((b) => b.startsWith("/merged"))).toHaveLength(1);
+		expect(commentsPosted(calls, 11).filter((b) => b.startsWith("/merged"))).toHaveLength(1);
+		expect(gh.state.closed).toEqual([1, 2]);
+		expect(builds.get("10")).toMatchObject({ status: "merged", announced: true });
+		expect(stacks.get("s1-t")).toMatchObject({ status: "merged" });
+
+		// The other order: a layer merged elsewhere, the closed webhook is the first we hear of it.
+		const gh2 = fakeGitHub({ issues: { 5: issue(5, "alice") }, pulls: { 20: spull(20, "b5") } });
+		const w = ctxWith({ github: conn, settings, fetch: gh2.fetch });
+		w.stacks.set("s5-t", { id: "s5-t", issues: [5], prs: { "5": 20 }, status: "stopped", createdBy: "alice", createdAt: "2026-01-01T00:00:00Z", updatedAt: "2026-01-01T00:00:00Z" });
+		w.builds.set("20", { pr: 20, title: "PR 20", author: "alice", headRef: "b5", headSha: "abc1234", staticBranch: "static/b5", attempt: 1, status: "passed", issue: 5, stack: "s5-t", updatedAt: "2026-01-01T00:00:00Z" });
+		gh2.markMerged(20);
+		await route("webhook")({ input: { action: "closed", pull_request: gh2.state.pulls[20], repository: { full_name: "acme/site" } } }, w.ctx);
+		await route("webhook")({ input: { action: "closed", pull_request: gh2.state.pulls[20], repository: { full_name: "acme/site" } } }, w.ctx);
+		expect(commentsPosted(w.calls, 20).filter((b) => b.startsWith("/merged"))).toHaveLength(1);
+		expect(gh2.state.closed).toEqual([5]);
+		expect(w.builds.get("20")).toMatchObject({ status: "merged", announced: true });
+	});
+
 	it("without numbers, stacks the issue's open sub-issues in their order", async () => {
 		const gh = fakeGitHub({ issues: { 7: issue(7, "alice"), 8: issue(8, "alice"), 9: issue(9, "alice") }, subIssues: { 7: [9, 8] } });
 		const { ctx, store } = ctxWith({ github: conn, settings, fetch: gh.fetch });
