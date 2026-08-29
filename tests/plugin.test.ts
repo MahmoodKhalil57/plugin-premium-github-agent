@@ -336,10 +336,43 @@ describe("default branch", () => {
 		await route("ci-callback")(await signed(branchResult(2, false), canonicalCi), ctx);
 		expect(builds.get("branch:main")).toMatchObject({ status: "failed", previous });
 
-		const page = (await route("admin")({ input: { type: "page_load", page: "/github-agent" } }, ctx)) as { blocks: Array<{ type: string; text?: string }> };
-		const line = page.blocks.find((b) => b.type === "context" && b.text?.startsWith("Previous deployments:"))?.text ?? "";
-		expect(line).toContain("1 back — static/main-b-1 @ prev1sh → https://preview-acme-site-main-b-1.example.workers.dev");
-		expect(line).toContain("2 back — static/main-b-2 @ prev2sh → https://preview-acme-site-main-b-2.example.workers.dev");
+		const page = (await route("admin")({ input: { type: "page_load", page: "/github-agent" } }, ctx)) as { blocks: Array<{ type: string; block_id?: string; columns?: Array<{ key: string; format?: string }>; rows?: Array<Record<string, string>> }> };
+		const table = page.blocks.find((b) => b.type === "table" && b.block_id === "deployments");
+		expect(table?.columns?.find((c) => c.key === "url")?.format).toBe("link");
+		expect(table?.rows).toEqual([
+			{ slot: "Live", branch: "static/main @ stat123", url: "https://site.example" },
+			{ slot: "Live (GitHub Pages origin)", branch: "static/main", url: "https://acme.github.io/site/" },
+			{ slot: "1 back", branch: "static/main-b-1 @ prev1sh", url: "https://preview-acme-site-main-b-1.example.workers.dev" },
+			{ slot: "2 back", branch: "static/main-b-2 @ prev2sh", url: "https://preview-acme-site-main-b-2.example.workers.dev" },
+		]);
+	});
+
+	it("the Deployments dashboard widget links live, the kept deployments and open PR previews", async () => {
+		const { ctx, builds } = ctxWith({
+			github: conn,
+			settings,
+			fetch: async (url, init) => {
+				if (url.endsWith("/branches/main")) return Response.json({ commit: { sha: "mainsha" } });
+				if (url.endsWith("/ci")) return Response.json({ accepted: true }, { status: 202 });
+				if (url.endsWith("/pages") && (init?.method ?? "GET") === "GET") return Response.json({ build_type: "legacy", source: { branch: "static/main", path: "/" }, html_url: "https://acme.github.io/site/" });
+				return Response.json({});
+			},
+		});
+		await route("site/build")({ input: {} }, ctx);
+		await route("ci-callback")(await signed(branchResult(1, true, previous), canonicalCi), ctx);
+		builds.set("7", { pr: 7, title: "Bigger footer", author: "alice", headRef: "feat", headSha: "f", staticBranch: "static/feat", attempt: 1, status: "passed", previewUrl: "https://preview-acme-site-pr7.example.workers.dev", updatedAt: "2026-01-01T00:00:00Z" });
+		builds.set("8", { pr: 8, title: "Closed one", author: "alice", headRef: "old", headSha: "o", staticBranch: "static/old", attempt: 1, status: "closed", updatedAt: "2026-01-01T00:00:00Z" });
+
+		const widget = (await route("admin")({ input: { type: "page_load", page: "widget:deployments" } }, ctx)) as { blocks: Array<{ type: string; fields?: Array<{ label: string; value: string; url?: string }> }> };
+		const fields = widget.blocks.find((b) => b.type === "fields")?.fields ?? [];
+		expect(fields.map((f) => [f.label, f.url])).toEqual([
+			["Live — static/main @ stat123", "https://site.example"],
+			["1 back — static/main-b-1 @ prev1sh", "https://preview-acme-site-main-b-1.example.workers.dev"],
+			["2 back — static/main-b-2 @ prev2sh", "https://preview-acme-site-main-b-2.example.workers.dev"],
+			["PR #7 — Bigger footer", "https://preview-acme-site-pr7.example.workers.dev"],
+			["GitHub Pages origin", "https://acme.github.io/site/"],
+		]);
+		expect(fields[0]?.value).toBe("site.example");
 	});
 
 	it("ignores pushes to other branches and to static/*", async () => {

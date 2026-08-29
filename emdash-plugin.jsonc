@@ -24,6 +24,9 @@
 
 	"admin": {
 		"pages": [{ "path": "/github-agent", "label": "GitHub Agent", "icon": "git-pull-request" }],
-		"widgets": [{ "id": "agent-runs", "title": "GitHub Agent", "size": "half" }],
+		"widgets": [
+			{ "id": "deployments", "title": "Deployments", "size": "half" },
+			{ "id": "agent-runs", "title": "GitHub Agent", "size": "half" },
+		],
 	},
 }

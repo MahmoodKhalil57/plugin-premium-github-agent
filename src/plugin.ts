@@ -976,6 +976,7 @@ const plugin: SandboxedPlugin = {
 					values?: Record<string, unknown>;
 				};
 				if (i.type === "page_load" && i.page === "widget:agent-runs") return buildWidget(ctx);
+				if (i.type === "page_load" && i.page === "widget:deployments") return buildDeploymentsWidget(ctx);
 				if (i.type === "form_submit" && i.action_id === "save_settings") {
 					await saveSettings(ctx, i.values ?? {});
 					return buildPage(ctx, "Settings saved.");
@@ -1117,12 +1118,16 @@ async function buildPage(ctx: PluginContext, notice?: string) {
 				: `Site (${conn.branch}): not built by the platform yet — pushes to ${conn.branch} and content publishes build it to ${staticBranchFor(conn.branch)}.`,
 		});
 		blocks.push({
-			type: "context",
-			text: site?.previous?.length
-				? `Previous deployments: ${site.previous
-						.map((p, i) => `${i + 1} back — ${p.branch} @ ${p.sha.slice(0, 7)}${p.previewUrl ? ` → ${p.previewUrl}` : " (no preview)"}`)
-						.join(" · ")}`
-				: `Previous deployments: none kept yet — each build keeps the last ${PREVIOUS_DEPLOYMENTS} on ${staticBranchFor(conn.branch)}-b-1 … -b-${PREVIOUS_DEPLOYMENTS}, each with its own preview URL.`,
+			type: "table",
+			block_id: "deployments",
+			page_action_id: "deployments_page",
+			empty_text: `No previous deployments kept yet — each build keeps the last ${PREVIOUS_DEPLOYMENTS} on ${staticBranchFor(conn.branch)}-b-1 … -b-${PREVIOUS_DEPLOYMENTS}, each with its own preview URL.`,
+			columns: [
+				{ key: "slot", label: "Deployment", format: "text" },
+				{ key: "branch", label: "Branch", format: "code" },
+				{ key: "url", label: "URL", format: "link" },
+			],
+			rows: deploymentRows(ctx.site.url, site, pagesUrl),
 		});
 		blocks.push({
 			type: "actions",
@@ -1174,7 +1179,7 @@ async function buildPage(ctx: PluginContext, notice?: string) {
 				{ key: "status", label: "CI", format: "badge" },
 				{ key: "attempt", label: "Attempt", format: "text" },
 				{ key: "static", label: "Static branch", format: "code" },
-				{ key: "preview", label: "Preview", format: "text" },
+				{ key: "preview", label: "Preview", format: "link" },
 				{ key: "summary", label: "Result", format: "text" },
 				{ key: "updated", label: "Updated", format: "relative_time" },
 			],
@@ -1288,9 +1293,57 @@ async function buildWidget(ctx: PluginContext) {
 				type: "fields",
 				fields: runs.map((r) => ({
 					label: `#${r.number} ${r.title}`,
-					value: r.prUrl ?? `${STATUS_LABEL[r.status]}${r.reason ? ` · ${r.reason}` : ""}`,
+					value: r.prUrl ? withoutScheme(r.prUrl) : `${STATUS_LABEL[r.status]}${r.reason ? ` · ${r.reason}` : ""}`,
+					...(r.prUrl ? { url: r.prUrl } : {}),
 				})),
 			},
 		],
 	};
+}
+
+function withoutScheme(url: string): string {
+	return url.replace(/^https?:\/\//, "").replace(/\/$/, "");
+}
+
+/** Live, one back, two back: one row per slot, plus the GitHub Pages origin behind the live site. */
+function deploymentRows(siteUrl: string, site: Build | null, pagesUrl: string | null | undefined) {
+	const rows: Array<{ slot: string; branch: string; url: string }> = [];
+	if (site?.staticSha) rows.push({ slot: "Live", branch: `${site.staticBranch} @ ${site.staticSha.slice(0, 7)}`, url: siteUrl });
+	if (site?.staticSha && pagesUrl) rows.push({ slot: "Live (GitHub Pages origin)", branch: site.staticBranch, url: pagesUrl });
+	for (const [i, p] of (site?.previous ?? []).entries()) {
+		rows.push({ slot: `${i + 1} back`, branch: `${p.branch} @ ${p.sha.slice(0, 7)}`, url: p.previewUrl ?? "no preview" });
+	}
+	return rows;
+}
+
+/** Dashboard card: every URL that currently serves this site — live, the kept deployments, and open PR previews. */
+async function buildDeploymentsWidget(ctx: PluginContext) {
+	const conn = await getConnection(ctx);
+	if (!conn) return { blocks: [{ type: "context", text: "Connect GitHub in Settings → General to build the site on the platform." }] };
+	const site = await getBranchBuild(ctx, conn.branch);
+	const pagesUrl = await ctx.kv.get<string>("pages:url");
+	const fields: Array<{ label: string; value: string; url?: string }> = [];
+	fields.push({
+		label: site?.staticSha ? `Live — ${site.staticBranch} @ ${site.staticSha.slice(0, 7)}` : "Live",
+		value: withoutScheme(ctx.site.url),
+		url: ctx.site.url,
+	});
+	for (const [i, p] of (site?.previous ?? []).entries()) {
+		fields.push({
+			label: `${i + 1} back — ${p.branch} @ ${p.sha.slice(0, 7)}`,
+			value: p.previewUrl ? withoutScheme(p.previewUrl) : "no preview",
+			...(p.previewUrl ? { url: p.previewUrl } : {}),
+		});
+	}
+	for (const b of (await listBuilds(ctx, 50)).filter((b) => b.pr > 0 && b.previewUrl)) {
+		fields.push({ label: `PR #${b.pr} — ${b.title}`, value: withoutScheme(b.previewUrl!), url: b.previewUrl });
+	}
+	if (pagesUrl && site?.staticSha) fields.push({ label: "GitHub Pages origin", value: withoutScheme(pagesUrl), url: pagesUrl });
+	const blocks: unknown[] = [{ type: "fields", fields }];
+	if (!site) {
+		blocks.push({ type: "context", text: `Not built by the platform yet — pushes to ${conn.branch} and content publishes build it to ${staticBranchFor(conn.branch)}; the two previous deployments then stay on ${staticBranchFor(conn.branch)}-b-1 / -b-2 with their own preview URLs.` });
+	} else if (site.status === "running") {
+		blocks.push({ type: "context", text: `Building ${conn.branch} (attempt ${site.attempt})…` });
+	}
+	return { blocks };
 }
