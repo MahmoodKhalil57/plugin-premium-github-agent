@@ -1,0 +1,47 @@
+{
+	"$schema": "../../node_modules/@emdash-cms/plugin-cli/schemas/emdash-plugin.schema.json",
+
+	"slug": "premium-starter",
+	// Publisher identity. This is syntactically valid so `validate` / `build` /
+	// `bundle` all run today, but the handle must actually resolve to an atproto
+	// identity you control before `emdash-plugin publish` will succeed — the CLI
+	// signs the release into that identity's repo. Set up the handle (or swap in
+	// a did:plc:... ) and run `emdash-plugin login` before the first publish.
+	"publisher": "plugins.premium-cms.com",
+
+	"license": "MIT",
+	"author": { "name": "PremiumCMS" },
+	"security": {
+		"url": "https://github.com/MahmoodKhalil57/premium-cms-plugins/security/advisories/new",
+	},
+	"description": "Reference plugin: tracks when published content was last updated and flags anything that has gone stale.",
+	"keywords": ["premiumcms", "reference", "content", "freshness", "editorial"],
+
+	// ── Trust contract ────────────────────────────────────────────────
+	// Every entry here is consent the user grants at install time, so keep
+	// it as small as the plugin can function with. Changing any of these
+	// between releases requires a version bump.
+	//
+	//   capabilities  — runtime APIs unlocked on `ctx`. "content:read"
+	//                   is what puts `ctx.content` on the context; without
+	//                   it that property is undefined.
+	//   allowedHosts  — outbound fetch allow-list. Empty means this plugin
+	//                   makes no network calls at all, which is the easiest
+	//                   contract for a user to accept.
+	//   storage       — declares the plugin's own tables. Declaring an index
+	//                   is what makes a field usable in `where` / `orderBy`.
+	"capabilities": ["content:read"],
+	"allowedHosts": [],
+	"storage": {
+		"tracked": { "indexes": ["updatedAt", "collection", "status"] },
+	},
+
+	// ── Admin surface ─────────────────────────────────────────────────
+	// Both are rendered by the `admin` route in src/plugin.ts, which
+	// receives a `page_load` interaction naming either the page path or
+	// `widget:<id>`.
+	"admin": {
+		"pages": [{ "path": "/freshness", "label": "Content Freshness", "icon": "clock" }],
+		"widgets": [{ "id": "stale-content", "title": "Needs Review", "size": "half" }],
+	},
+}

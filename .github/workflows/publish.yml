@@ -1,0 +1,45 @@
+# Publish this plugin to the PremiumCMS marketplace on every push to main.
+# MARKETPLACE_URL, MARKETPLACE_TOKEN and PLUGIN_ID are set as repo secrets by
+# the platform when the repo is created from Plugins → Marketplace →
+# "Create and fork plugin". Bump the version in package.json to release.
+name: Publish to the marketplace
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - run: bun install
+      - name: Validate, build, bundle
+        run: |
+          bunx emdash-plugin validate .
+          bunx emdash-plugin build
+          bunx emdash-plugin bundle
+      - name: Publish
+        env:
+          MARKETPLACE_URL: ${{ secrets.MARKETPLACE_URL }}
+          MARKETPLACE_TOKEN: ${{ secrets.MARKETPLACE_TOKEN }}
+          PLUGIN_ID: ${{ secrets.PLUGIN_ID }}
+        run: |
+          set -euo pipefail
+          : "${MARKETPLACE_URL:?not set}" "${MARKETPLACE_TOKEN:?not set}" "${PLUGIN_ID:?not set}"
+          BUNDLE=$(ls dist/*.tar.gz | head -1)
+          VERSION=$(node -p "require('./package.json').version")
+          OUT=$(curl -sS -X POST "${MARKETPLACE_URL%/}/api/v1/plugins/${PLUGIN_ID}/versions" \
+            -H "Authorization: Bearer $MARKETPLACE_TOKEN" -A "premium-cms-plugin-publish/1.0" \
+            -F "bundle=@${BUNDLE}" -w "\n%{http_code}")
+          CODE=$(echo "$OUT" | tail -1); BODY=$(echo "$OUT" | sed '$d')
+          echo "$BODY"
+          case "$CODE" in
+            2*) echo "published ${PLUGIN_ID}@${VERSION}" ;;
+            409) echo "${PLUGIN_ID}@${VERSION} already published — bump the version to release" ;;
+            *) echo "::error::marketplace returned $CODE"; exit 1 ;;
+          esac
