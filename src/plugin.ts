@@ -21,6 +21,7 @@ import type { PluginContext, SandboxedPlugin } from "@premium-cms/emdash/plugin"
 import {
 	canonicalCallback,
 	canonicalCi,
+	deletePreview,
 	dispatch,
 	dispatchCi,
 	hmacHex,
@@ -208,7 +209,7 @@ function issueNumberFromEvent(input: unknown): { action: string; number: number;
 
 // ── Pull-request builds ──────────────────────────────────────────────────
 
-type BuildStatus = "running" | "passed" | "failed" | "error" | "capped";
+type BuildStatus = "running" | "passed" | "failed" | "error" | "capped" | "closed";
 
 /** One row per PR in the `builds` storage: the latest CI attempt and its outcome. */
 interface Build {
@@ -219,6 +220,8 @@ interface Build {
 	headSha: string;
 	staticBranch: string;
 	staticSha?: string;
+	/** Cloudflare-hosted preview of the latest passing build. */
+	previewUrl?: string;
 	/** CI attempts on this PR (across agent fixes). */
 	attempt: number;
 	status: BuildStatus;
@@ -260,7 +263,13 @@ function stepLine(name: string, s: { ok: boolean; seconds: number } | null): str
 }
 
 function firstFailure(r: CiResult): { name: string; log: string } | null {
-	for (const [name, s] of [["check:cf", r.check], ["build", r.build], ["static push", r.push], ["test:cf", r.test]] as const) {
+	for (const [name, s] of [
+		["check:cf", r.check],
+		["build", r.build],
+		["static push", r.push],
+		["test:cf", r.test],
+		["preview", r.preview],
+	] as const) {
 		if (s && !s.ok) return { name, log: s.log };
 	}
 	return null;
@@ -276,6 +285,8 @@ function ciComment(conn: Connection, b: Build, r: CiResult, next: string): strin
 		stepLine("build (astro)", r.build),
 		stepLine(`static build → [\`${r.staticBranch}\`](${staticUrl})`, r.push),
 		stepLine("test:cf", r.test),
+		...(r.preview ? [stepLine("preview on Cloudflare", r.preview)] : []),
+		...(r.previewUrl ? ["", `**Preview:** ${r.previewUrl}`] : []),
 		...(r.staticSha ? ["", `Static build commit: ${r.staticSha.slice(0, 7)} (force-pushed; the branch always holds the latest build of this PR).`] : []),
 		...(failure
 			? ["", `<details><summary>${failure.name} output</summary>`, "", "```", failure.log.trim().slice(-5000), "```", "", "</details>"]
@@ -372,11 +383,14 @@ async function recordCi(ctx: PluginContext, settings: Settings, conn: Connection
 		...build,
 		status: r.ok ? "passed" : "failed",
 		staticSha: r.staticSha ?? build.staticSha,
+		previewUrl: r.previewUrl ?? build.previewUrl,
 		summary: r.ok ? `passed on attempt ${r.attempt}` : (firstFailure(r)?.name ?? r.error ?? "failed"),
 	};
 	let closing: string;
 	if (r.ok) {
-		closing = `Ready for review. The static build of this PR lives on \`${r.staticBranch}\`.`;
+		closing = r.previewUrl
+			? `Ready for review — preview it at ${r.previewUrl}. The static build lives on \`${r.staticBranch}\`.`
+			: `Ready for review. The static build of this PR lives on \`${r.staticBranch}\`.`;
 	} else if (agentPr && !exhausted) {
 		closing = `The agent will push a fix to \`${build.headRef}\` (build attempt ${r.attempt + 1} of ${settings.maxBuildAttempts}).`;
 	} else if (agentPr) {
@@ -392,7 +406,7 @@ async function recordCi(ctx: PluginContext, settings: Settings, conn: Connection
 		state: r.ok ? "success" : "failure",
 		context: STATUS_CONTEXT,
 		description: r.ok ? `passed (attempt ${r.attempt}); static: ${r.staticBranch}` : `${next.summary} (attempt ${r.attempt})`,
-		targetUrl: `https://github.com/${conn.owner}/${conn.repo}/pull/${r.pr}`,
+		targetUrl: r.previewUrl ?? `https://github.com/${conn.owner}/${conn.repo}/pull/${r.pr}`,
 	}).catch(() => undefined);
 
 	if (!r.ok && agentPr && !exhausted && build.issue !== undefined) {
@@ -448,11 +462,21 @@ const plugin: SandboxedPlugin = {
 			handler: async (routeCtx, ctx) => {
 				const pull = pullFromEvent(routeCtx.input);
 				if (pull) {
+					const setup = await requireSetup(ctx);
+					if (!setup.ok) return { success: false, error: setup.error };
+					if (pull.action === "closed") {
+						const build = await getBuild(ctx, pull.number);
+						if (build) {
+							const deleted = build.previewUrl
+								? await deletePreview(ctx, setup.settings, setup.conn, pull.number).catch(() => false)
+								: false;
+							await putBuild(ctx, { ...build, status: "closed", previewUrl: undefined, summary: `closed; preview ${deleted ? "removed" : "not removed"}` });
+						}
+						return { success: true, pr: pull.number, closed: true };
+					}
 					if (!["opened", "synchronize", "reopened", "ready_for_review"].includes(pull.action)) {
 						return { success: true, ignored: `action ${pull.action}` };
 					}
-					const setup = await requireSetup(ctx);
-					if (!setup.ok) return { success: false, error: setup.error };
 					if (!setup.settings.enabled) return { success: true, ignored: "disabled" };
 					const pr = await getPull(ctx, setup.conn, pull.number);
 					if (!pr) return { success: true, ignored: "pull request not found" };
@@ -817,7 +841,7 @@ async function buildPage(ctx: PluginContext, notice?: string) {
 		});
 		const builds = await listBuilds(ctx, 30);
 		blocks.push({ type: "divider" });
-		blocks.push({ type: "section", text: "Pull requests built by the platform (check:cf → build → static branch → test:cf)." });
+		blocks.push({ type: "section", text: "Pull requests built by the platform (check:cf → build → static branch → test:cf → Cloudflare preview)." });
 		blocks.push({
 			type: "table",
 			block_id: "pulls",
@@ -830,6 +854,7 @@ async function buildPage(ctx: PluginContext, notice?: string) {
 				{ key: "status", label: "CI", format: "badge" },
 				{ key: "attempt", label: "Attempt", format: "text" },
 				{ key: "static", label: "Static branch", format: "code" },
+				{ key: "preview", label: "Preview", format: "text" },
 				{ key: "summary", label: "Result", format: "text" },
 				{ key: "updated", label: "Updated", format: "relative_time" },
 			],
@@ -840,6 +865,7 @@ async function buildPage(ctx: PluginContext, notice?: string) {
 				status: b.status,
 				attempt: `${b.attempt} / ${settings.maxBuildAttempts}`,
 				static: b.staticSha ? `${b.staticBranch} @ ${b.staticSha.slice(0, 7)}` : b.staticBranch,
+				preview: b.previewUrl ?? "-",
 				summary: b.summary ?? "",
 				updated: b.updatedAt,
 			})),

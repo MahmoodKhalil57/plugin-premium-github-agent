@@ -39,7 +39,12 @@ built in a Cloudflare container by the agent worker (`POST /ci`, Sandbox SDK):
 2. `astro build` against the site's live content snapshot,
 3. `dist/` is force-pushed to `static/<branch>` — one branch per PR that always
    holds the latest build, so it can be served straight away later,
-4. `npm run test:cf`.
+4. `npm run test:cf`,
+5. when everything passed, the build is hosted on Cloudflare as an assets-only
+   Worker (`preview-<owner>-<repo>-pr<N>.<account>.workers.dev`) and the URL
+   is posted on the PR (comment + commit-status link). The preview is deleted
+   when the PR closes. The worker needs `CF_ACCOUNT_ID` / `CF_API_TOKEN`
+   secrets (Workers Scripts edit) for this; without them the step is skipped.
 
 The result is posted as a PR comment and a `premium-cms/ci` commit status. When
 the PR is the agent's own fix branch (`agent/issue-N-…`) and CI failed, the

@@ -61,7 +61,7 @@ function pull(n: number, author: string, headRef: string, sha = "abc1234") {
 
 function ciResult(pr: number, attempt: number, ok: boolean) {
 	const step = (k: boolean) => ({ ok: k, log: k ? "fine" : "boom", seconds: 1 });
-	return { pr, attempt, headSha: "abc1234", staticBranch: "static/agent/issue-1-x", staticSha: ok ? "def5678" : null, check: step(true), build: step(ok), push: ok ? step(true) : null, test: ok ? step(true) : null, ok, ...(ok ? {} : { error: "build failed" }) };
+	return { pr, attempt, headSha: "abc1234", staticBranch: "static/agent/issue-1-x", staticSha: ok ? "def5678" : null, check: step(true), build: step(ok), push: ok ? step(true) : null, test: ok ? step(true) : null, preview: ok ? step(true) : null, previewUrl: ok ? `https://preview-acme-site-pr${pr}.example.workers.dev` : null, ok, ...(ok ? {} : { error: "build failed" }) };
 }
 
 const conn = { token: "gho_x", owner: "acme", repo: "site", branch: "main", previewSecret: "prev" };
@@ -235,8 +235,30 @@ describe("pull requests", () => {
 
 		const cb = (await route("ci-callback")(await signedCi(ciResult(10, 1, true)), ctx)) as { success: boolean; status: string };
 		expect(cb).toMatchObject({ success: true, status: "passed" });
-		expect(builds.get("10")).toMatchObject({ attempt: 1, staticBranch: "static/agent/issue-1-x", staticSha: "def5678", issue: 1, status: "passed" });
-		expect(calls.some((c) => c.url.endsWith("/issues/10/comments"))).toBe(true);
+		expect(builds.get("10")).toMatchObject({ attempt: 1, staticBranch: "static/agent/issue-1-x", staticSha: "def5678", issue: 1, status: "passed", previewUrl: "https://preview-acme-site-pr10.example.workers.dev" });
+		const comment = JSON.parse(String(calls.find((c) => c.url.endsWith("/issues/10/comments"))?.init?.body)).body;
+		expect(comment).toContain("https://preview-acme-site-pr10.example.workers.dev");
+		const status = JSON.parse(String(calls.filter((c) => c.url.includes("/statuses/")).pop()?.init?.body));
+		expect(status).toMatchObject({ state: "success", target_url: "https://preview-acme-site-pr10.example.workers.dev" });
+	});
+
+	it("removes the preview and marks the build closed when the PR closes", async () => {
+		const { ctx, builds, calls } = ctxWith({
+			github: conn,
+			settings,
+			fetch: async (url, init) => {
+				if (url.endsWith("/pulls/10")) return Response.json(pull(10, "alice", "agent/issue-1-x"));
+				if (url.endsWith("/ci")) return Response.json({ accepted: true }, { status: 202 });
+				if (url.includes("/preview?") && init?.method === "DELETE") return Response.json({ deleted: true });
+				return Response.json({});
+			},
+		});
+		await route("webhook")({ input: { action: "opened", pull_request: pull(10, "alice", "agent/issue-1-x") } }, ctx);
+		await route("ci-callback")(await signedCi(ciResult(10, 1, true)), ctx);
+		await route("webhook")({ input: { action: "closed", pull_request: pull(10, "alice", "agent/issue-1-x") } }, ctx);
+		expect(builds.get("10")).toMatchObject({ status: "closed" });
+		expect(builds.get("10")?.previewUrl).toBeUndefined();
+		expect(calls.some((c) => c.url.includes("/preview?") && c.init?.method === "DELETE")).toBe(true);
 	});
 
 	it("rejects a CI callback with a bad signature", async () => {

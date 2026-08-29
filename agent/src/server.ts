@@ -15,7 +15,7 @@ import { skills } from "@cloudflare/think";
 
 import { Sandbox } from "@cloudflare/sandbox";
 
-import { runCi, type CiInput } from "./ci.js";
+import { previewWorkerName, runCi, type CiInput } from "./ci.js";
 import { FIX_ISSUE_SKILL } from "./skill.js";
 
 export { Sandbox };
@@ -28,6 +28,9 @@ interface Env {
 	AGENT_KEY: string;
 	/** Default model; `run` may override per request. */
 	MODEL?: string;
+	/** Platform Cloudflare account that hosts PR previews (assets-only Workers). */
+	CF_ACCOUNT_ID?: string;
+	CF_API_TOKEN?: string;
 }
 
 const GITHUB_MCP = "https://api.githubcopilot.com/mcp/";
@@ -203,7 +206,11 @@ export class IssueFixer extends Think<Env> {
 	}
 
 	async ciJob(input: CiInput): Promise<void> {
-		const result = await runCi(this.env.Sandbox, input);
+		const host =
+			this.env.CF_ACCOUNT_ID && this.env.CF_API_TOKEN
+				? { accountId: this.env.CF_ACCOUNT_ID, apiToken: this.env.CF_API_TOKEN }
+				: null;
+		const result = await runCi(this.env.Sandbox, input, host);
 		const payload = JSON.stringify(result);
 		const sig = await hmac(this.env.AGENT_KEY, payload);
 		for (let i = 0; i < 3; i++) {
@@ -362,6 +369,21 @@ export default {
 			}
 			const agent = await getAgentByName(env.IssueFixer, nameFor(owner, repo, issue));
 			return json(await agent.status(id));
+		}
+
+		// Remove a PR's preview Worker (the PR was closed or merged).
+		if (request.method === "DELETE" && url.pathname === "/preview") {
+			const owner = url.searchParams.get("owner") ?? "";
+			const repo = url.searchParams.get("repo") ?? "";
+			const pr = Number(url.searchParams.get("pr"));
+			if (!owner || !repo || !Number.isInteger(pr)) return json({ error: "owner, repo, pr required" }, 400);
+			if (!env.CF_ACCOUNT_ID || !env.CF_API_TOKEN) return json({ error: "previews are not configured" }, 501);
+			const name = previewWorkerName(owner, repo, pr);
+			const r = await fetch(
+				`https://api.cloudflare.com/client/v4/accounts/${env.CF_ACCOUNT_ID}/workers/scripts/${name}`,
+				{ method: "DELETE", headers: { Authorization: `Bearer ${env.CF_API_TOKEN}` } },
+			);
+			return json({ name, deleted: r.ok || r.status === 404 });
 		}
 
 		if (request.method === "GET" && url.pathname === "/transcript") {

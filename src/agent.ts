@@ -43,7 +43,7 @@ export function runId(number: number): string {
 async function call(
 	ctx: PluginContext,
 	settings: Settings,
-	method: "GET" | "POST",
+	method: "GET" | "POST" | "DELETE",
 	path: string,
 	body?: unknown,
 ): Promise<{ ok: boolean; status: number; json: Record<string, unknown> }> {
@@ -82,6 +82,8 @@ export interface CiResult {
 	build: CiStep | null;
 	push: CiStep | null;
 	test: CiStep | null;
+	preview: CiStep | null;
+	previewUrl: string | null;
 	ok: boolean;
 	error?: string;
 }
@@ -98,9 +100,18 @@ export function canonicalCi(r: CiResult): string {
 		build: r.build,
 		push: r.push,
 		test: r.test,
+		preview: r.preview ?? null,
+		previewUrl: r.previewUrl ?? null,
 		ok: r.ok,
 		...(r.error !== undefined ? { error: r.error } : {}),
 	});
+}
+
+/** Remove a PR's preview Worker (best-effort, when the PR closes). */
+export async function deletePreview(ctx: PluginContext, settings: Settings, conn: Connection, pr: number): Promise<boolean> {
+	const q = new URLSearchParams({ owner: conn.owner, repo: conn.repo, pr: String(pr) });
+	const r = await call(ctx, settings, "DELETE", `/preview?${q}`);
+	return r.ok && r.json.deleted === true;
 }
 
 /** Start a PR build; the worker accepts it and POSTs the result to `ci-callback` when done. */

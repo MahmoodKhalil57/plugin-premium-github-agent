@@ -44,8 +44,23 @@ export interface CiResult {
 	build: StepResult | null;
 	push: StepResult | null;
 	test: StepResult | null;
+	/** Hosting the passing build on Cloudflare (assets-only Worker). */
+	preview: StepResult | null;
+	previewUrl: string | null;
 	ok: boolean;
 	error?: string;
+}
+
+/** Cloudflare account that hosts PR previews (the platform's). */
+export interface PreviewHost {
+	accountId: string;
+	apiToken: string;
+}
+
+/** Worker name for a PR preview: stable per (repo, PR), valid for workers.dev. */
+export function previewWorkerName(owner: string, repo: string, pr: number): string {
+	const slug = `${owner}-${repo}`.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+	return `preview-${slug.slice(0, 40).replace(/-+$/, "")}-pr${pr}`;
 }
 
 const LOG_TAIL = 6000;
@@ -71,7 +86,11 @@ async function step(
 	}
 }
 
-export async function runCi(ns: DurableObjectNamespace<Sandbox>, input: CiInput): Promise<CiResult> {
+export async function runCi(
+	ns: DurableObjectNamespace<Sandbox>,
+	input: CiInput,
+	host: PreviewHost | null,
+): Promise<CiResult> {
 	const out: CiResult = {
 		pr: input.pr,
 		attempt: input.attempt,
@@ -82,6 +101,8 @@ export async function runCi(ns: DurableObjectNamespace<Sandbox>, input: CiInput)
 		build: null,
 		push: null,
 		test: null,
+		preview: null,
+		previewUrl: null,
 		ok: false,
 	};
 	const sb = getSandbox(ns, `${input.owner}/${input.repo}#${input.pr}`.toLowerCase(), { sleepAfter: "5m" });
@@ -171,6 +192,32 @@ export async function runCi(ns: DurableObjectNamespace<Sandbox>, input: CiInput)
 		if (!out.test.ok) {
 			out.error = "test:cf failed";
 			return out;
+		}
+
+		// Tests passed: host the exact bytes that went to the static branch as an
+		// assets-only Worker on the platform account. The config never touches
+		// the static branch (it is written after the push).
+		if (host) {
+			const name = previewWorkerName(input.owner, input.repo, input.pr);
+			await sb.writeFile(
+				`${OUT}/wrangler.preview.jsonc`,
+				JSON.stringify({ name, compatibility_date: "2026-08-01", assets: { directory: "./" }, workers_dev: true }),
+			);
+			out.preview = await step(
+				sb,
+				"rm -rf .git && npx --yes wrangler@4 deploy --config wrangler.preview.jsonc 2>&1 | grep -viE 'api token|account id'",
+				{
+					cwd: OUT,
+					env: { CLOUDFLARE_API_TOKEN: host.apiToken, CLOUDFLARE_ACCOUNT_ID: host.accountId, WRANGLER_SEND_METRICS: "false" },
+					timeout: 10 * 60_000,
+				},
+			);
+			const url = out.preview.log.match(/https:\/\/[a-z0-9.-]+\.workers\.dev/)?.[0] ?? null;
+			if (!out.preview.ok || !url) {
+				out.error = "preview deploy failed";
+				return out;
+			}
+			out.previewUrl = url;
 		}
 		out.ok = true;
 		return out;
