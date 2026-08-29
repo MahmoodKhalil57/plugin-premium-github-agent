@@ -16,6 +16,8 @@ export interface Settings {
 	reasoning: "low" | "medium" | "high";
 	/** How many CI runs a PR gets before the agent stops retrying (fix → build → test loops). */
 	maxBuildAttempts: number;
+	/** Squash-merge a PR into the default branch once every check passed. */
+	autoMerge: boolean;
 }
 
 export const DEFAULTS: Settings = {
@@ -27,6 +29,7 @@ export const DEFAULTS: Settings = {
 	model: "@cf/zai-org/glm-5.3-flash",
 	reasoning: "high",
 	maxBuildAttempts: 3,
+	autoMerge: true,
 };
 
 const PREFIX = "settings:";
@@ -62,6 +65,7 @@ export async function readSettings(ctx: PluginContext): Promise<Settings> {
 		model: (typeof map.model === "string" && map.model.trim()) || DEFAULTS.model,
 		reasoning: reasoning === "low" || reasoning === "medium" ? reasoning : "high",
 		maxBuildAttempts: clampAttempts(map.maxBuildAttempts),
+		autoMerge: typeof map.autoMerge === "boolean" ? map.autoMerge : DEFAULTS.autoMerge,
 	};
 }
 
@@ -85,6 +89,7 @@ export async function saveSettings(ctx: PluginContext, values: Record<string, un
 	if (values.maxBuildAttempts !== undefined) {
 		await ctx.kv.set(`${PREFIX}maxBuildAttempts`, clampAttempts(values.maxBuildAttempts));
 	}
+	if (typeof values.autoMerge === "boolean") await ctx.kv.set(`${PREFIX}autoMerge`, values.autoMerge);
 }
 
 /** Master switch: with `enabled` off, webhooks and manual runs are ignored. */

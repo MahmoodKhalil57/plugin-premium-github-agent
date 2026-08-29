@@ -228,3 +228,18 @@ export async function branchHead(ctx: PluginContext, conn: Connection, branch: s
 	if (!r.ok) return null;
 	return String((r.json as { commit?: { sha?: string } })?.commit?.sha ?? "") || null;
 }
+
+/** Squash-merge a pull request. `merged: false` with a message when GitHub refuses (conflicts, checks). */
+export async function mergePull(
+	ctx: PluginContext,
+	conn: Connection,
+	number: number,
+	title: string,
+): Promise<{ merged: boolean; sha?: string; message: string }> {
+	const r = await gh(ctx, conn, "PUT", `/repos/${conn.owner}/${conn.repo}/pulls/${number}/merge`, {
+		merge_method: "squash",
+		commit_title: `${title} (#${number})`,
+	});
+	const j = (r.json ?? {}) as { merged?: boolean; sha?: string; message?: string };
+	return { merged: r.ok && j.merged === true, sha: j.sha, message: j.message ?? (r.ok ? "merged" : `GitHub ${r.status}`) };
+}

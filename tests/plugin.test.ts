@@ -223,6 +223,7 @@ describe("pull requests", () => {
 			settings,
 			fetch: async (url) => {
 				if (url.endsWith("/pulls/10")) return Response.json(pull(10, "alice", "agent/issue-1-x"));
+				if (url.endsWith("/pulls/10/merge")) return Response.json({ merged: true, sha: "merged1", message: "Pull Request successfully merged" });
 				if (url.endsWith("/ci")) return Response.json({ accepted: true }, { status: 202 });
 				return Response.json({});
 			},
@@ -234,8 +235,11 @@ describe("pull requests", () => {
 		expect(ci).toMatchObject({ pr: 10, headRef: "agent/issue-1-x", staticBranch: "static/agent/issue-1-x", previewSecret: "prev", token: "gho_x", attempt: 1 });
 
 		const cb = (await route("ci-callback")(await signedCi(ciResult(10, 1, true)), ctx)) as { success: boolean; status: string };
-		expect(cb).toMatchObject({ success: true, status: "passed" });
-		expect(builds.get("10")).toMatchObject({ attempt: 1, staticBranch: "static/agent/issue-1-x", staticSha: "def5678", issue: 1, status: "passed", previewUrl: "https://preview-acme-site-pr10.example.workers.dev" });
+		expect(cb).toMatchObject({ success: true, status: "merged" });
+		expect(builds.get("10")).toMatchObject({ attempt: 1, staticBranch: "static/agent/issue-1-x", staticSha: "def5678", issue: 1, status: "merged", previewUrl: "https://preview-acme-site-pr10.example.workers.dev" });
+		const merge = calls.find((c) => c.url.endsWith("/pulls/10/merge"));
+		expect(merge?.init?.method).toBe("PUT");
+		expect(JSON.parse(String(merge?.init?.body))).toMatchObject({ merge_method: "squash" });
 		const comment = JSON.parse(String(calls.find((c) => c.url.endsWith("/issues/10/comments"))?.init?.body)).body;
 		expect(comment).toContain("https://preview-acme-site-pr10.example.workers.dev");
 		const status = JSON.parse(String(calls.filter((c) => c.url.includes("/statuses/")).pop()?.init?.body));
@@ -397,5 +401,28 @@ describe("preview tests", () => {
 		expect(builds.get("13")).toMatchObject({ status: "failed", summary: "test:preview:cf", previewUrl: "https://preview-acme-site-pr13.example.workers.dev" });
 		expect(runs[0]).toMatch(/test:preview:cf/);
 		expect(runs[0]).toMatch(/expected 200, got 500/);
+	});
+});
+
+describe("auto-merge", () => {
+	it("leaves the PR open when auto-merge is off, and when GitHub refuses the merge", async () => {
+		const mk = (autoMerge: boolean, mergeOk: boolean) =>
+			ctxWith({
+				github: conn,
+				settings: { ...settings, autoMerge },
+				fetch: async (url) => {
+					if (url.endsWith("/pulls/14")) return Response.json(pull(14, "alice", "feature"));
+					if (url.endsWith("/pulls/14/merge")) return mergeOk ? Response.json({ merged: true, sha: "m" }) : Response.json({ message: "Pull Request is not mergeable" }, { status: 405 });
+					if (url.endsWith("/ci")) return Response.json({ accepted: true }, { status: 202 });
+					return Response.json({});
+				},
+			});
+		for (const [autoMerge, mergeOk, expected] of [[false, true, "passed"], [true, false, "passed"], [true, true, "merged"]] as const) {
+			const { ctx, builds, calls } = mk(autoMerge, mergeOk);
+			await route("webhook")({ input: { action: "opened", pull_request: pull(14, "alice", "feature") } }, ctx);
+			await route("ci-callback")(await signedCi(ciResult(14, 1, true)), ctx);
+			expect(builds.get("14")?.status).toBe(expected);
+			expect(calls.some((c) => c.url.endsWith("/pulls/14/merge"))).toBe(autoMerge);
+		}
 	});
 });

@@ -42,6 +42,7 @@ import {
 	getIssue,
 	getPull,
 	listIssues,
+	mergePull,
 	servePagesFromBranch,
 	setStatus,
 	type Connection,
@@ -211,7 +212,7 @@ function issueNumberFromEvent(input: unknown): { action: string; number: number;
 
 // ── Pull-request builds ──────────────────────────────────────────────────
 
-type BuildStatus = "running" | "passed" | "failed" | "error" | "capped" | "closed";
+type BuildStatus = "running" | "passed" | "merged" | "failed" | "error" | "capped" | "closed";
 
 /** Storage id of the default-branch build row. */
 function branchBuildId(branch: string): string {
@@ -408,9 +409,10 @@ async function recordCi(ctx: PluginContext, settings: Settings, conn: Connection
 	};
 	let closing: string;
 	if (r.ok) {
-		closing = r.previewUrl
-			? `Ready for review — preview it at ${r.previewUrl}. The static build lives on \`${r.staticBranch}\`.`
-			: `Ready for review. The static build of this PR lives on \`${r.staticBranch}\`.`;
+		closing = [
+			r.previewUrl ? `Preview: ${r.previewUrl}. The static build lives on \`${r.staticBranch}\`.` : `The static build lives on \`${r.staticBranch}\`.`,
+			settings.autoMerge ? `All checks passed — merging into \`${conn.branch}\`, which rebuilds \`${staticBranchFor(conn.branch)}\`.` : "Ready for review.",
+		].join(" ");
 	} else if (agentPr && !exhausted) {
 		closing = `The agent will push a fix to \`${build.headRef}\` (build attempt ${r.attempt + 1} of ${settings.maxBuildAttempts}).`;
 	} else if (agentPr) {
@@ -428,6 +430,18 @@ async function recordCi(ctx: PluginContext, settings: Settings, conn: Connection
 		description: r.ok ? `passed (attempt ${r.attempt}); static: ${r.staticBranch}` : `${next.summary} (attempt ${r.attempt})`,
 		targetUrl: r.previewUrl ?? `https://github.com/${conn.owner}/${conn.repo}/pull/${r.pr}`,
 	}).catch(() => undefined);
+
+	if (r.ok && settings.autoMerge) {
+		const m = await mergePull(ctx, conn, r.pr, build.title).catch((e) => ({ merged: false, message: String(e) }));
+		if (m.merged) {
+			next = { ...next, status: "merged", summary: `merged into ${conn.branch}${m.sha ? ` @ ${m.sha.slice(0, 7)}` : ""}` };
+			await putBuild(ctx, next);
+			ctx.log.info(`PR #${r.pr} merged into ${conn.branch}`, { sha: m.sha });
+		} else {
+			await comment(ctx, conn, r.pr, `Could not merge automatically: ${m.message}. The PR stays open for a human.`).catch(() => undefined);
+			ctx.log.warn(`PR #${r.pr}: auto-merge refused: ${m.message}`);
+		}
+	}
 
 	if (!r.ok && agentPr && !exhausted && build.issue !== undefined) {
 		const failure = firstFailure(r);
@@ -598,7 +612,12 @@ const plugin: SandboxedPlugin = {
 							const deleted = build.previewUrl
 								? await deletePreview(ctx, setup.settings, setup.conn, pull.number).catch(() => false)
 								: false;
-							await putBuild(ctx, { ...build, status: "closed", previewUrl: undefined, summary: `closed; preview ${deleted ? "removed" : "not removed"}` });
+							await putBuild(ctx, {
+								...build,
+								status: build.status === "merged" ? "merged" : "closed",
+								previewUrl: undefined,
+								summary: `${build.status === "merged" ? build.summary : "closed"}; preview ${deleted ? "removed" : "not removed"}`,
+							});
 						}
 						return { success: true, pr: pull.number, closed: true };
 					}
@@ -1083,6 +1102,13 @@ async function buildPage(ctx: PluginContext, notice?: string) {
 				initial_value: settings.maxBuildAttempts,
 				min: 1,
 				max: 10,
+			},
+			{
+				type: "toggle",
+				action_id: "autoMerge",
+				label: "Auto-merge pull requests that pass every check",
+				description: "Squash-merges into the default branch, which rebuilds the site.",
+				initial_value: settings.autoMerge,
 			},
 			{ type: "text_input", action_id: "agentUrl", label: "Agent worker URL", initial_value: settings.agentUrl },
 			{

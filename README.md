@@ -48,7 +48,10 @@ built in a Cloudflare container by the agent worker (`POST /ci`, Sandbox SDK):
 6. `npm run test:preview:cf` runs against the live preview (`PREVIEW_URL`):
    the shipped test just fetches it; a project can put Playwright, Cloudflare
    Browser Rendering or anything else behind that script. A failure here goes
-   back to the agent like any other step.
+   back to the agent like any other step,
+7. with every check green the PR is squash-merged into the default branch
+   (**Auto-merge** setting, on by default), whose push rebuilds `static/<default>`;
+   the preview is removed when the PR closes.
 
 The result is posted as a PR comment and a `premium-cms/ci` commit status. When
 the PR is the agent's own fix branch (`agent/issue-N-…`) and CI failed, the
@@ -56,8 +59,8 @@ agent is asked to push a fix to the same branch with the failing output; GitHub
 reports the push (`synchronize`), CI runs again onto the same static branch —
 until it passes or **Max build attempts per PR** (default 3) is used up. The
 agent's own dry-run attempts are capped separately (each retry is a new
-attempt on the same issue). Everything stays open: one issue, one PR, one fix
-branch, one static branch.
+attempt on the same issue). Until the checks pass everything stays open: one
+issue, one PR, one fix branch, one static branch; a green PR is merged.
 
 Routes: `webhook` (platform-authenticated: `issues` + `pull_request` events),
 `agent-callback` / `ci-callback` (public, HMAC-signed), and admin-authenticated
