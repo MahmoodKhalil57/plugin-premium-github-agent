@@ -5,7 +5,7 @@
 
 import { describe, expect, it } from "vitest";
 
-import { canonicalCallback, hmacHex } from "../src/agent.js";
+import { canonicalCallback, canonicalCi, hmacHex } from "../src/agent.js";
 import plugin from "../src/plugin.js";
 import { parseUsers } from "../src/settings.js";
 
@@ -211,27 +211,38 @@ describe("issues/run", () => {
 	});
 });
 
+async function signedCi(cb: Record<string, unknown>, key = "k") {
+	const sig = await hmacHex(key, canonicalCi(cb as never));
+	return { input: cb, request: { headers: { "x-agent-signature": `sha256=${sig}` } } };
+}
+
 describe("pull requests", () => {
-	it("builds a PR from a whitelisted author and records the passing result", async () => {
+	it("builds a PR from a whitelisted author and records the passing result from the callback", async () => {
 		const { ctx, builds, calls } = ctxWith({
 			github: conn,
 			settings,
-			fetch: async (url, init) => {
+			fetch: async (url) => {
 				if (url.endsWith("/pulls/10")) return Response.json(pull(10, "alice", "agent/issue-1-x"));
-				if (url.endsWith("/ci")) {
-					const body = JSON.parse(String(init?.body));
-					return Response.json(ciResult(10, body.attempt, true));
-				}
+				if (url.endsWith("/ci")) return Response.json({ accepted: true }, { status: 202 });
 				return Response.json({});
 			},
 		});
 		const r = (await route("webhook")({ input: { action: "opened", pull_request: pull(10, "alice", "agent/issue-1-x") } }, ctx)) as { started: boolean; status: string };
 		expect(r.started).toBe(true);
-		expect(r.status).toBe("passed");
-		expect(builds.get("10")).toMatchObject({ attempt: 1, staticBranch: "static/agent/issue-1-x", staticSha: "def5678", issue: 1 });
+		expect(r.status).toBe("running");
 		const ci = JSON.parse(String(calls.find((c) => c.url.endsWith("/ci"))?.init?.body));
-		expect(ci).toMatchObject({ pr: 10, headRef: "agent/issue-1-x", staticBranch: "static/agent/issue-1-x", previewSecret: "prev", token: "gho_x" });
+		expect(ci).toMatchObject({ pr: 10, headRef: "agent/issue-1-x", staticBranch: "static/agent/issue-1-x", previewSecret: "prev", token: "gho_x", attempt: 1 });
+
+		const cb = (await route("ci-callback")(await signedCi(ciResult(10, 1, true)), ctx)) as { success: boolean; status: string };
+		expect(cb).toMatchObject({ success: true, status: "passed" });
+		expect(builds.get("10")).toMatchObject({ attempt: 1, staticBranch: "static/agent/issue-1-x", staticSha: "def5678", issue: 1, status: "passed" });
 		expect(calls.some((c) => c.url.endsWith("/issues/10/comments"))).toBe(true);
+	});
+
+	it("rejects a CI callback with a bad signature", async () => {
+		const { ctx } = ctxWith({ github: conn, settings });
+		const cb = (await route("ci-callback")(await signedCi(ciResult(10, 1, true), "wrong"), ctx)) as { success: boolean };
+		expect(cb.success).toBe(false);
 	});
 
 	it("asks the agent to fix a failing build on its own PR, then stops at the cap", async () => {
@@ -242,7 +253,7 @@ describe("pull requests", () => {
 			fetch: async (url, init) => {
 				if (url.endsWith("/pulls/11")) return Response.json(pull(11, "alice", "agent/issue-1-x"));
 				if (url.endsWith("/issues/1")) return Response.json(issue(1, "alice"));
-				if (url.endsWith("/ci")) return Response.json(ciResult(11, JSON.parse(String(init?.body)).attempt, false));
+				if (url.endsWith("/ci")) return Response.json({ accepted: true }, { status: 202 });
 				if (url.endsWith("/run")) {
 					runs.push(JSON.parse(String(init?.body)).note ?? "");
 					return Response.json({ submissionId: `s${runs.length}`, accepted: true });
@@ -252,10 +263,12 @@ describe("pull requests", () => {
 		});
 		const ev = { input: { action: "synchronize", pull_request: pull(11, "alice", "agent/issue-1-x") } };
 		await route("webhook")(ev, ctx);
+		await route("ci-callback")(await signedCi(ciResult(11, 1, false)), ctx);
 		expect(builds.get("11")?.status).toBe("failed");
 		expect(runs.length).toBe(1);
 		expect(runs[0]).toMatch(/CI failed on your pull request #11/);
 		await route("webhook")(ev, ctx);
+		await route("ci-callback")(await signedCi(ciResult(11, 2, false)), ctx);
 		expect(builds.get("11")?.status).toBe("capped");
 		expect(runs.length).toBe(1);
 		const third = (await route("webhook")(ev, ctx)) as { started: boolean; reason: string };

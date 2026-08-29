@@ -333,9 +333,9 @@ async function buildPull(
 	}).catch(() => undefined);
 
 	try {
-		// The worker runs the job to completion and also POSTs the signed result
-		// to ci-callback; this direct response is the same payload.
-		const result = await dispatchCi(ctx, settings, conn, {
+		// The worker runs the job in its own durable object and POSTs the
+		// signed result to ci-callback, where recordCi finishes the story.
+		await dispatchCi(ctx, settings, conn, {
 			pr: pr.number,
 			headRef: pr.headRef,
 			headSha: pr.headSha,
@@ -345,8 +345,7 @@ async function buildPull(
 			siteUrl: ctx.site.url,
 			callbackUrl: ciCallbackUrl(ctx),
 		});
-		const after = await recordCi(ctx, settings, conn, result);
-		return { started: true, build: after ?? build };
+		return { started: true, build };
 	} catch (error) {
 		const failed: Build = { ...build, status: "error", summary: String(error) };
 		await putBuild(ctx, failed);
@@ -360,8 +359,7 @@ async function buildPull(
  * when the PR is the agent's own fix branch and the run failed — ask the
  * agent to push a fix (which GitHub reports as `synchronize`, re-running CI
  * onto the same static branch) until `maxBuildAttempts` is used up.
- * Idempotent per (pr, attempt): the worker's callback and the direct response
- * carry the same payload.
+ * Idempotent per (pr, attempt).
  */
 async function recordCi(ctx: PluginContext, settings: Settings, conn: Connection, r: CiResult): Promise<Build | null> {
 	const build = await getBuild(ctx, r.pr);

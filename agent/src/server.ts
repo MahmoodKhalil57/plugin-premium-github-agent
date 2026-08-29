@@ -192,6 +192,39 @@ export class IssueFixer extends Think<Env> {
 		}
 	}
 
+	/**
+	 * Pull-request CI. `startCi` schedules the job on this object (durable,
+	 * runs to completion inside the container) and returns at once; `ciJob`
+	 * signs and POSTs the result to the plugin when done.
+	 */
+	async startCi(input: CiInput): Promise<{ accepted: true }> {
+		await this.schedule(1, "ciJob", input);
+		return { accepted: true };
+	}
+
+	async ciJob(input: CiInput): Promise<void> {
+		const result = await runCi(this.env.Sandbox, input);
+		const payload = JSON.stringify(result);
+		const sig = await hmac(this.env.AGENT_KEY, payload);
+		for (let i = 0; i < 3; i++) {
+			try {
+				const r = await fetch(input.callbackUrl, {
+					method: "POST",
+					headers: {
+						"Content-Type": "application/json",
+						"X-Agent-Signature": `sha256=${sig}`,
+						"User-Agent": "premium-cms-issue-agent/1.0",
+					},
+					body: payload,
+				});
+				if (r.ok) return;
+			} catch {
+				/* retry */
+			}
+			await new Promise((res) => setTimeout(res, 5000 * (i + 1)));
+		}
+	}
+
 	/** Compact transcript: every text + tool part, for operators and the admin page. */
 	async transcript(limit = 60): Promise<Array<{ role: string; type: string; text: string }>> {
 		const out: Array<{ role: string; type: string; text: string }> = [];
@@ -293,8 +326,8 @@ export default {
 			return json(out);
 		}
 
-		// Pull-request CI: runs to completion inside the request (the container
-		// does the work), then also POSTs the signed result to the callback.
+		// Pull-request CI: accepted immediately, run inside a durable object
+		// (the container does the work), result POSTed to the callback.
 		if (request.method === "POST" && url.pathname === "/ci") {
 			const body = (await request.json().catch(() => null)) as Partial<CiInput> | null;
 			const need = ["owner", "repo", "headRef", "headSha", "staticBranch", "token", "backendUrl", "siteUrl", "callbackUrl"] as const;
@@ -315,19 +348,8 @@ export default {
 				siteUrl: body.siteUrl!,
 				callbackUrl: body.callbackUrl!,
 			};
-			const result = await runCi(env.Sandbox, input);
-			const payload = JSON.stringify(result);
-			const sig = await hmac(env.AGENT_KEY, payload);
-			await fetch(input.callbackUrl, {
-				method: "POST",
-				headers: {
-					"Content-Type": "application/json",
-					"X-Agent-Signature": `sha256=${sig}`,
-					"User-Agent": "premium-cms-issue-agent/1.0",
-				},
-				body: payload,
-			}).catch(() => undefined);
-			return json(result);
+			const agent = await getAgentByName(env.IssueFixer, `ci:${nameFor(input.owner, input.repo, input.pr)}`);
+			return json(await agent.startCi(input), 202);
 		}
 
 		if (request.method === "GET" && url.pathname === "/status") {

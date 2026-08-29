@@ -103,7 +103,7 @@ export function canonicalCi(r: CiResult): string {
 	});
 }
 
-/** Start a PR build; the worker runs it to completion and calls back. */
+/** Start a PR build; the worker accepts it and POSTs the result to `ci-callback` when done. */
 export async function dispatchCi(
 	ctx: PluginContext,
 	settings: Settings,
@@ -118,7 +118,7 @@ export async function dispatchCi(
 		siteUrl: string;
 		callbackUrl: string;
 	},
-): Promise<CiResult> {
+): Promise<void> {
 	const r = await call(ctx, settings, "POST", "/ci", {
 		owner: conn.owner,
 		repo: conn.repo,
@@ -126,10 +126,9 @@ export async function dispatchCi(
 		previewSecret: conn.previewSecret,
 		...input,
 	});
-	if (!r.ok || typeof r.json.pr !== "number") {
-		throw new Error(`agent ${r.status}: ${String(r.json.error ?? "ci failed to start")}`);
+	if (!r.ok || r.json.accepted !== true) {
+		throw new Error(`agent ${r.status}: ${String(r.json.error ?? "ci was not accepted")}`);
 	}
-	return r.json as unknown as CiResult;
 }
 
 export async function dispatch(
