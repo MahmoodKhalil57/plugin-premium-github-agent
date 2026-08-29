@@ -287,6 +287,7 @@ function firstFailure(r: CiResult): { name: string; log: string } | null {
 		["static push", r.push],
 		["test:cf", r.test],
 		["preview", r.preview],
+		["test:preview:cf", r.previewTest],
 	] as const) {
 		if (s && !s.ok) return { name, log: s.log };
 	}
@@ -304,6 +305,7 @@ function ciComment(conn: Connection, b: Build, r: CiResult, next: string): strin
 		stepLine(`static build → [\`${r.staticBranch}\`](${staticUrl})`, r.push),
 		stepLine("test:cf", r.test),
 		...(r.preview ? [stepLine("preview on Cloudflare", r.preview)] : []),
+		...(r.previewTest ? [stepLine("test:preview:cf (against the preview)", r.previewTest)] : []),
 		...(r.previewUrl ? ["", `**Preview:** ${r.previewUrl}`] : []),
 		...(r.staticSha ? ["", `Static build commit: ${r.staticSha.slice(0, 7)} (force-pushed; the branch always holds the latest build of this PR).`] : []),
 		...(failure
@@ -994,7 +996,7 @@ async function buildPage(ctx: PluginContext, notice?: string) {
 		});
 		const builds = await listBuilds(ctx, 30);
 		blocks.push({ type: "divider" });
-		blocks.push({ type: "section", text: "Pull requests built by the platform (check:cf → build → static branch → test:cf → Cloudflare preview)." });
+		blocks.push({ type: "section", text: "Pull requests built by the platform (check:cf → build → static branch → test:cf → Cloudflare preview → test:preview:cf)." });
 		blocks.push({
 			type: "table",
 			block_id: "pulls",

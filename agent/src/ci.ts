@@ -52,6 +52,8 @@ export interface CiResult {
 	/** Hosting the passing build on Cloudflare (assets-only Worker). */
 	preview: StepResult | null;
 	previewUrl: string | null;
+	/** `test:preview:cf` run against the live preview (PREVIEW_URL). */
+	previewTest: StepResult | null;
 	ok: boolean;
 	error?: string;
 }
@@ -91,6 +93,19 @@ async function step(
 	}
 }
 
+/** A fresh Worker takes a few seconds to answer on workers.dev; don't fail the suite on that. */
+async function waitForPreview(url: string): Promise<void> {
+	for (let i = 0; i < 12; i++) {
+		try {
+			const r = await fetch(url, { method: "GET", redirect: "manual" });
+			if (r.status < 500) return;
+		} catch {
+			/* not yet */
+		}
+		await new Promise((res) => setTimeout(res, 5000));
+	}
+}
+
 export async function runCi(
 	ns: DurableObjectNamespace<Sandbox>,
 	input: CiInput,
@@ -109,6 +124,7 @@ export async function runCi(
 		test: null,
 		preview: null,
 		previewUrl: null,
+		previewTest: null,
 		ok: false,
 	};
 	const sb = getSandbox(ns, `${input.owner}/${input.repo}#${input.pr}`.toLowerCase(), { sleepAfter: "5m" });
@@ -224,6 +240,19 @@ export async function runCi(
 				return out;
 			}
 			out.previewUrl = url;
+
+			// The preview is live: the project's own end-to-end suite runs against
+			// it (Playwright, Browser Rendering, plain fetch — the script decides).
+			await waitForPreview(url);
+			out.previewTest = await step(sb, "npm run --if-present test:preview:cf", {
+				cwd: WORK,
+				env: { PREVIEW_URL: url },
+				timeout: 15 * 60_000,
+			});
+			if (!out.previewTest.ok) {
+				out.error = "test:preview:cf failed";
+				return out;
+			}
 		}
 		out.ok = true;
 		return out;

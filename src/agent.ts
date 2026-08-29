@@ -86,6 +86,7 @@ export interface CiResult {
 	test: CiStep | null;
 	preview: CiStep | null;
 	previewUrl: string | null;
+	previewTest: CiStep | null;
 	ok: boolean;
 	error?: string;
 }
@@ -105,6 +106,7 @@ export function canonicalCi(r: CiResult): string {
 		test: r.test,
 		preview: r.preview ?? null,
 		previewUrl: r.previewUrl ?? null,
+		previewTest: r.previewTest ?? null,
 		ok: r.ok,
 		...(r.error !== undefined ? { error: r.error } : {}),
 	});

@@ -61,7 +61,7 @@ function pull(n: number, author: string, headRef: string, sha = "abc1234") {
 
 function ciResult(pr: number, attempt: number, ok: boolean) {
 	const step = (k: boolean) => ({ ok: k, log: k ? "fine" : "boom", seconds: 1 });
-	return { pr, branch: "agent/issue-1-x", attempt, headSha: "abc1234", staticBranch: "static/agent/issue-1-x", staticSha: ok ? "def5678" : null, check: step(true), build: step(ok), push: ok ? step(true) : null, test: ok ? step(true) : null, preview: ok ? step(true) : null, previewUrl: ok ? `https://preview-acme-site-pr${pr}.example.workers.dev` : null, ok, ...(ok ? {} : { error: "build failed" }) };
+	return { pr, branch: "agent/issue-1-x", attempt, headSha: "abc1234", staticBranch: "static/agent/issue-1-x", staticSha: ok ? "def5678" : null, check: step(true), build: step(ok), push: ok ? step(true) : null, test: ok ? step(true) : null, preview: ok ? step(true) : null, previewUrl: ok ? `https://preview-acme-site-pr${pr}.example.workers.dev` : null, previewTest: ok ? step(true) : null, ok, ...(ok ? {} : { error: "build failed" }) };
 }
 
 const conn = { token: "gho_x", owner: "acme", repo: "site", branch: "main", previewSecret: "prev" };
@@ -313,7 +313,7 @@ describe("pull requests", () => {
 describe("default branch", () => {
 	function branchResult(attempt: number, ok: boolean) {
 		const step = (k: boolean) => ({ ok: k, log: k ? "fine" : "boom", seconds: 1 });
-		return { pr: 0, branch: "main", attempt, headSha: "mainsha", staticBranch: "static/main", staticSha: ok ? "stat123" : null, check: step(true), build: step(ok), push: ok ? step(true) : null, test: ok ? step(true) : null, preview: null, previewUrl: null, ok, ...(ok ? {} : { error: "build failed" }) };
+		return { pr: 0, branch: "main", attempt, headSha: "mainsha", staticBranch: "static/main", staticSha: ok ? "stat123" : null, check: step(true), build: step(ok), push: ok ? step(true) : null, test: ok ? step(true) : null, preview: null, previewUrl: null, previewTest: null, ok, ...(ok ? {} : { error: "build failed" }) };
 	}
 
 	it("builds main on push, then switches Pages to static/main when it passes", async () => {
@@ -371,5 +371,31 @@ describe("default branch", () => {
 		expect(ciCalls).toBe(1);
 		await route("ci-callback")(await signedCi(branchResult(1, true)), ctx);
 		expect(ciCalls).toBe(2);
+	});
+});
+
+describe("preview tests", () => {
+	it("a failing test:preview:cf sends the agent the preview-test output", async () => {
+		const runs: string[] = [];
+		const { ctx, builds } = ctxWith({
+			github: conn,
+			settings,
+			fetch: async (url, init) => {
+				if (url.endsWith("/pulls/13")) return Response.json(pull(13, "alice", "agent/issue-1-x"));
+				if (url.endsWith("/issues/1")) return Response.json(issue(1, "alice"));
+				if (url.endsWith("/ci")) return Response.json({ accepted: true }, { status: 202 });
+				if (url.endsWith("/run")) {
+					runs.push(JSON.parse(String(init?.body)).note ?? "");
+					return Response.json({ submissionId: "s", accepted: true });
+				}
+				return Response.json({});
+			},
+		});
+		await route("webhook")({ input: { action: "opened", pull_request: pull(13, "alice", "agent/issue-1-x") } }, ctx);
+		const r = { ...ciResult(13, 1, true), previewTest: { ok: false, log: "expected 200, got 500", seconds: 3 }, ok: false, error: "test:preview:cf failed" };
+		await route("ci-callback")(await signedCi(r), ctx);
+		expect(builds.get("13")).toMatchObject({ status: "failed", summary: "test:preview:cf", previewUrl: "https://preview-acme-site-pr13.example.workers.dev" });
+		expect(runs[0]).toMatch(/test:preview:cf/);
+		expect(runs[0]).toMatch(/expected 200, got 500/);
 	});
 });

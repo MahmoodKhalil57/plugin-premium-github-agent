@@ -44,7 +44,11 @@ built in a Cloudflare container by the agent worker (`POST /ci`, Sandbox SDK):
    Worker (`preview-<owner>-<repo>-pr<N>.<account>.workers.dev`) and the URL
    is posted on the PR (comment + commit-status link). The preview is deleted
    when the PR closes. The worker needs `CF_ACCOUNT_ID` / `CF_API_TOKEN`
-   secrets (Workers Scripts edit) for this; without them the step is skipped.
+   secrets (Workers Scripts edit) for this; without them the step is skipped,
+6. `npm run test:preview:cf` runs against the live preview (`PREVIEW_URL`):
+   the shipped test just fetches it; a project can put Playwright, Cloudflare
+   Browser Rendering or anything else behind that script. A failure here goes
+   back to the agent like any other step.
 
 The result is posted as a PR comment and a `premium-cms/ci` commit status. When
 the PR is the agent's own fix branch (`agent/issue-N-…`) and CI failed, the
