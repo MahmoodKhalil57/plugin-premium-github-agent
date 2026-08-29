@@ -80,3 +80,18 @@ It needs a Workers Paid plan (Workers AI). The platform runs one shared instance
 at `https://premium-cms-issue-agent.premiumcms.workers.dev`; any deployment
 works as long as its URL host is allowed by the plugin manifest
 (`*.workers.dev`, `*.premium-cms.com`).
+
+## Repository context: `.agents/skills/` and `.mcp.json`
+
+On every run the worker reads the site repository (at its default branch):
+
+- `.agents/skills/<name>/SKILL.md` — [Agent Skills](https://developers.cloudflare.com/agents/runtime/execution/agent-skills/)
+  (`name` / `description` frontmatter + instructions; text files next to it
+  become skill resources). They are offered to the model alongside the built-in
+  `fix-github-issue` skill and named in the run prompt.
+- `.mcp.json` — `{"mcpServers": {"<name>": {"url": "https://…", "headers": {…}}}}`;
+  remote HTTP servers are connected for the run. `command` (stdio) servers
+  cannot run in a Worker and are skipped; never commit secrets.
+
+New site repos start with a `site-conventions` skill and an empty `.mcp.json`
+(from the frontend template); projects edit them like any other file.

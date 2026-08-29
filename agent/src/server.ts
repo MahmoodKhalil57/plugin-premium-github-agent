@@ -16,6 +16,7 @@ import { skills } from "@cloudflare/think";
 import { Sandbox } from "@cloudflare/sandbox";
 
 import { previewWorkerName, runCi, type CiInput } from "./ci.js";
+import { loadRepoContext, type RepoContext } from "./repo-context.js";
 import { FIX_ISSUE_SKILL } from "./skill.js";
 
 export { Sandbox };
@@ -82,14 +83,15 @@ export class IssueFixer extends Think<Env> {
 		return "You fix GitHub issues by opening pull requests. Activate the fix-github-issue skill and follow it exactly. You cannot run code.";
 	}
 
-	getSkills() {
-		return [
-			skills.fromManifest({
-				id: "premium-cms-issue-agent",
-				fingerprint: "fix-github-issue@2",
-				skills: [FIX_ISSUE_SKILL],
-			}),
-		];
+	async getSkills() {
+		const builtin = skills.fromManifest({
+			id: "premium-cms-issue-agent",
+			fingerprint: "fix-github-issue@2",
+			skills: [FIX_ISSUE_SKILL],
+		});
+		// The repository's own .agents/skills, captured by the last run().
+		const repo = (await this.ctx.storage.get<RepoContext["manifest"]>("repo:skills")) ?? null;
+		return repo ? [builtin, skills.fromManifest(repo)] : [builtin];
 	}
 
 	getSkillScriptRunner() {
@@ -115,10 +117,10 @@ export class IssueFixer extends Think<Env> {
 		this.reasoning = input.reasoning ?? "high";
 
 		const existing = this.getMcpServers();
-		const connected = Object.values(existing.servers ?? {}).some(
-			(s: { name?: string }) => s.name === "github",
+		const connectedNames = new Set(
+			Object.values(existing.servers ?? {}).map((s: { name?: string }) => s.name ?? ""),
 		);
-		if (!connected) {
+		if (!connectedNames.has("github")) {
 			await this.addMcpServer("github", GITHUB_MCP, {
 				transport: {
 					type: "streamable-http",
@@ -130,6 +132,30 @@ export class IssueFixer extends Think<Env> {
 			});
 		}
 
+		// Project-supplied context: .agents/skills (as a skill source) and
+		// .mcp.json servers (connected by name; already-known names are kept).
+		const repoCtx = await loadRepoContext(input.owner, input.repo, input.branch, input.token).catch(
+			(e): RepoContext => ({ sha: "", manifest: null, mcp: [], notes: [`repo context unavailable: ${String(e)}`] }),
+		);
+		await this.ctx.storage.put("repo:skills", repoCtx.manifest);
+		for (const server of repoCtx.mcp) {
+			if (connectedNames.has(server.name) || server.name === "github") continue;
+			try {
+				await this.addMcpServer(server.name, server.url, {
+					transport: { type: "auto", headers: server.headers },
+				});
+			} catch (e) {
+				repoCtx.notes.push(`.mcp.json: "${server.name}" failed to connect: ${String(e)}`);
+			}
+		}
+		const contextLine = [
+			repoCtx.manifest ? `Repository skills available: ${repoCtx.manifest.skills.map((s) => s.name).join(", ")} — activate the relevant ones before editing.` : "",
+			repoCtx.mcp.length ? `Extra MCP servers from .mcp.json: ${repoCtx.mcp.map((m) => m.name).join(", ")}.` : "",
+			...repoCtx.notes.map((n) => `Note: ${n}`),
+		]
+			.filter(Boolean)
+			.join("\n");
+
 		const attempt = Math.max(1, Math.floor(input.attempt ?? 1));
 		const text = [
 			`Repository: ${input.owner}/${input.repo} (default branch: ${input.branch})`,
@@ -138,6 +164,7 @@ export class IssueFixer extends Think<Env> {
 			attempt > 1
 				? `This is attempt ${attempt}. Re-read the issue and the repository state (branches and pull requests you opened earlier may exist — reuse or correct them rather than duplicating). Fix this issue and open or update a pull request. Do not merge it.`
 				: "Fix this issue and open a pull request. Do not merge it.",
+			...(contextLine ? ["", contextLine] : []),
 			...(input.note ? ["", input.note] : []),
 		].join("\n");
 
