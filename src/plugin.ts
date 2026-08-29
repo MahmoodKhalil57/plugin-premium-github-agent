@@ -33,7 +33,11 @@
  */
 
 import type { PluginContext, SandboxedPlugin } from "@premium-cms/emdash/plugin";
-import { z } from "zod";
+import type { ZodType } from "zod";
+// zod/mini keeps the marketplace bundle small (the classic API alone is ~75 KB
+// minified); the CLI turns these into JSON schema at build time, and the
+// plugin API is typed with the classic ZodType, hence the cast.
+import * as z from "zod/mini";
 
 import {
 	canonicalCallback,
@@ -136,6 +140,16 @@ function isStale(b: { status: string; updatedAt: string }): boolean {
 const AGENT_BRANCH = /^agent\/issue-(\d+)-/;
 
 // ── Helpers ──────────────────────────────────────────────────────────────
+
+/** A zod/mini schema where the plugin API expects a classic one (both share the v4 core the CLI reads). */
+function schema(s: unknown): ZodType {
+	return s as ZodType;
+}
+
+function described<T extends z.ZodMiniType>(s: T, description: string): T {
+	z.globalRegistry.add(s, { description });
+	return s;
+}
 
 function isRecord(v: unknown): v is Record<string, unknown> {
 	return typeof v === "object" && v !== null && !Array.isArray(v);
@@ -1307,35 +1321,42 @@ const plugin: SandboxedPlugin = {
 					"Open an issue on the site's connected GitHub repository. With agent=true (the default) the coding agent picks it up: it studies the repository, opens a pull request, the platform builds, tests and previews it, and merges it when every check passes; the site rebuilds afterwards. Describe the change precisely: what, where it shows on the page, the exact current text, what it should look like or do afterwards, acceptance criteria. `on` stacks the change on top of another issue's pull request (its branch) — for a change that depends on one still in flight; for a planned series use create_stack.",
 				route: "issues/create",
 				destructive: false,
-				input: z.object({
-					title: z.string().min(1).max(200).describe("Short imperative title"),
-					body: z.string().min(1).describe("What to change and why, with acceptance criteria"),
-					agent: z.boolean().optional().describe("Hand the issue to the coding agent (default true)"),
-					labels: z.array(z.string()).optional(),
-					on: z.number().int().positive().optional(),
-				}),
+				input: schema(
+					z.object({
+						title: described(z.string().check(z.minLength(1), z.maxLength(200)), "Short imperative title"),
+						body: described(z.string().check(z.minLength(1)), "What to change and why, with acceptance criteria"),
+						agent: described(z.optional(z.boolean()), "Hand the issue to the coding agent (default true)"),
+						labels: z.optional(z.array(z.string())),
+						on: described(z.optional(z.int().check(z.positive())), "Stack this change on top of that issue's pull request (its branch)"),
+					}),
+				),
 			},
 			list_issues: {
 				description: "Open issues on the site's repository with the agent's state for each (queued, working, done with a PR, failed, skipped).",
 				route: "issues",
 				destructive: false,
-				input: z.object({ label: z.string().optional() }),
+				input: schema(z.object({ label: z.optional(z.string()) })),
 			},
 			create_stack: {
 				description:
 					"Open several issues as ONE stack of layers, bottom first, and hand them to the coding agent: each layer's pull request builds on the branch of the one below, so dependent or same-area changes never conflict and never wait for each other's merge. The platform links them as a GitHub stack, builds every layer, and merges the stack bottom-up once every layer is green; the site rebuilds after the merge. Use it instead of several create_issue calls whenever the changes depend on each other or touch the same files; keep each layer small and independently reviewable.",
 				route: "stacks/create",
 				destructive: false,
-				input: z.object({
-					issues: z.array(z.object({ title: z.string().min(1), body: z.string() })).min(2).max(10),
-					labels: z.array(z.string()).optional(),
-				}),
+				input: schema(
+					z.object({
+						issues: described(
+							z.array(z.object({ title: z.string().check(z.minLength(1)), body: z.string() })).check(z.minLength(2), z.maxLength(10)),
+							"The layers, bottom first: the foundation, then each change that builds on the previous one (2–10)",
+						),
+						labels: z.optional(z.array(z.string())),
+					}),
+				),
 			},
 			issue_status: {
 				description: "Where one issue stands: the agent run (attempt, PR link or reason), the pull request's build / preview / merge state, its stack (layers, their PRs, what the stack is waiting for) and the site's latest default-branch build.",
 				route: "issues/status",
 				destructive: false,
-				input: z.object({ number: z.number().int().positive() }),
+				input: schema(z.object({ number: z.int().check(z.positive()) })),
 			},
 		},
 	},
