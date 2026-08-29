@@ -280,6 +280,35 @@ describe("/awaiting-test and the runner's reports", () => {
 	});
 });
 
+describe("MCP tools for assistants", () => {
+	it("declares create/list/status tools over author-level routes", () => {
+		const tools = (plugin as { mcp?: { tools: Record<string, { route: string }> } }).mcp?.tools ?? {};
+		expect(Object.keys(tools).sort()).toEqual(["create_issue", "issue_status", "list_issues"]);
+		for (const t of Object.values(tools)) {
+			expect((plugin.routes![t.route] as { permission?: string }).permission).toBe("content:edit_own");
+		}
+	});
+
+	it("issues/status reports the agent run, the PR build and the site build", async () => {
+		const { ctx, store, builds } = ctxWith({
+			github: conn,
+			settings,
+			fetch: async (url) => (url.endsWith("/issues/5") ? Response.json(issue(5, "alice", "Fix footer")) : Response.json({})),
+		});
+		store.set("5", { number: 5, title: "Fix footer", author: "alice", status: "completed", prUrl: "https://github.com/acme/site/pull/9", attempt: 1, updatedAt: "2026-01-01T00:00:00Z" });
+		builds.set("9", { pr: 9, title: "Fix footer", author: "alice", headRef: "agent/issue-5-x", headSha: "h", staticBranch: "static/agent/issue-5-x", attempt: 1, status: "merged", issue: 5, previewUrl: "https://preview-acme-site-pr9.example.workers.dev", summary: "merged into main", updatedAt: "2026-01-01T00:00:00Z" });
+		builds.set("branch:main", { pr: 0, title: "main", author: "acme", headRef: "main", headSha: "m", staticBranch: "static/main", staticSha: "s", attempt: 3, status: "passed", summary: "published to static/main", updatedAt: "2026-01-01T00:00:00Z" });
+		const r = (await route("issues/status")({ input: { number: 5 }, user: { id: "u", role: 30 } }, ctx)) as Record<string, unknown>;
+		expect(r).toMatchObject({
+			success: true,
+			issue: { number: 5, title: "Issue 5" },
+			agent: { status: "completed", prUrl: "https://github.com/acme/site/pull/9" },
+			pullRequest: { number: 9, status: "merged", previewUrl: "https://preview-acme-site-pr9.example.workers.dev" },
+			site: { status: "passed", staticBranch: "static/main" },
+		});
+	});
+});
+
 describe("default branch", () => {
 	type Previous = Array<{ branch: string; sha: string; previewUrl: string | null }>;
 	function branchResult(attempt: number, ok: boolean, previous: Previous = []) {

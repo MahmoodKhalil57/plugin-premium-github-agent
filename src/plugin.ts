@@ -30,6 +30,7 @@
  */
 
 import type { PluginContext, SandboxedPlugin } from "@premium-cms/emdash/plugin";
+import { z } from "zod";
 
 import {
 	canonicalCallback,
@@ -669,6 +670,40 @@ function pullFromEvent(input: unknown): { action: string; number: number; headSh
 // ── Plugin ───────────────────────────────────────────────────────────────
 
 const plugin: SandboxedPlugin = {
+	/**
+	 * Exposed on the site's own MCP endpoint (once an admin enables this
+	 * plugin's MCP tools), so an assistant acting as an editor can hand
+	 * frontend work to the coding agent and follow it.
+	 */
+	mcp: {
+		tools: {
+			create_issue: {
+				description:
+					"Open an issue on the site's connected GitHub repository. With agent=true (the default) the coding agent picks it up: it studies the repository, opens a pull request, the platform builds, tests and previews it, and merges it when every check passes; the site rebuilds afterwards. Describe the change precisely: what, where it shows on the page, the exact current text, what it should look like or do afterwards, acceptance criteria.",
+				route: "issues/create",
+				destructive: false,
+				input: z.object({
+					title: z.string().min(1).max(200).describe("Short imperative title"),
+					body: z.string().min(1).describe("What to change and why, with acceptance criteria"),
+					agent: z.boolean().optional().describe("Hand the issue to the coding agent (default true)"),
+					labels: z.array(z.string()).optional(),
+				}),
+			},
+			list_issues: {
+				description: "Open issues on the site's repository with the agent's state for each (queued, working, done with a PR, failed, skipped).",
+				route: "issues",
+				destructive: false,
+				input: z.object({ label: z.string().optional() }),
+			},
+			issue_status: {
+				description: "Where one issue stands: the agent run (attempt, PR link or reason), the pull request's build / preview / merge state, and the site's latest default-branch build.",
+				route: "issues/status",
+				destructive: false,
+				input: z.object({ number: z.number().int().positive() }),
+			},
+		},
+	},
+
 	hooks: {
 		"plugin:install": async (_event, ctx) => {
 			for (const [k, v] of Object.entries(DEFAULTS)) {
@@ -874,6 +909,7 @@ const plugin: SandboxedPlugin = {
 
 		/** Open issues on the connected repo, with the agent's state per issue. */
 		issues: {
+			permission: "content:edit_own",
 			handler: async (routeCtx, ctx) => {
 				const setup = await requireSetup(ctx);
 				if (!setup.ok) return { success: false, error: setup.error, items: [] };
@@ -895,8 +931,9 @@ const plugin: SandboxedPlugin = {
 			},
 		},
 
-		/** Create an issue; `agent: true` also applies the trigger label. */
+		/** Create an issue; `agent: true` (the default for MCP callers) ends the body with `/agent-issue`. */
 		"issues/create": {
+			permission: "content:edit_own",
 			handler: async (routeCtx, ctx) => {
 				const setup = await requireSetup(ctx);
 				if (!setup.ok) return { success: false, error: setup.error };
@@ -905,12 +942,48 @@ const plugin: SandboxedPlugin = {
 				if (!title) return { success: false, error: "A title is required." };
 				const labels = Array.isArray(input.labels) ? input.labels.map(String) : [];
 				const text = typeof input.body === "string" ? input.body : "";
+				const agent = input.agent !== false;
 				const issue = await createIssue(ctx, setup.conn, {
 					title,
-					body: input.agent === true && !commandsIn(text).includes("agent-issue") ? `${text.trimEnd()}\n\n/agent-issue` : text,
+					body: agent && !commandsIn(text).includes("agent-issue") ? `${text.trimEnd()}\n\n/agent-issue` : text,
 					labels,
 				});
-				return { success: true, issue };
+				return {
+					success: true,
+					issue,
+					agent,
+					next: agent
+						? "The coding agent starts when GitHub delivers the event: it opens a pull request, the platform builds and tests it, hosts a preview, and merges it when every check passes; the site rebuilds a minute or two later. Use issue_status to follow it."
+						: "Created without handing it to the agent.",
+				};
+			},
+		},
+
+		/** Where one issue stands: agent run, its PR build, and the site's latest build. */
+		"issues/status": {
+			permission: "content:edit_own",
+			handler: async (routeCtx, ctx) => {
+				const setup = await requireSetup(ctx);
+				if (!setup.ok) return { success: false, error: setup.error };
+				const input = isRecord(routeCtx.input) ? routeCtx.input : {};
+				const number = Number(input.number);
+				if (!Number.isInteger(number) || number <= 0) return { success: false, error: "Issue number required." };
+				const issue = await getIssue(ctx, setup.conn, number);
+				if (!issue) return { success: false, error: `Issue #${number} not found.` };
+				const run = await getRun(ctx, number);
+				const pull = (await listBuilds(ctx, 100)).find((b) => b.pr > 0 && b.issue === number) ?? null;
+				const site = await getBranchBuild(ctx, setup.conn.branch);
+				return {
+					success: true,
+					issue: { number: issue.number, title: issue.title, url: issue.url },
+					agent: run
+						? { status: run.status, attempt: run.attempt, prUrl: run.prUrl ?? null, reason: run.reason ?? null, answer: run.answer ?? null }
+						: { status: "not started" },
+					pullRequest: pull
+						? { number: pull.pr, status: pull.status, attempt: pull.attempt, previewUrl: pull.previewUrl ?? null, summary: pull.summary ?? null, staticBranch: pull.staticBranch }
+						: null,
+					site: site ? { status: site.status, summary: site.summary ?? null, staticBranch: site.staticBranch, staticSha: site.staticSha ?? null } : null,
+				};
 			},
 		},
 
