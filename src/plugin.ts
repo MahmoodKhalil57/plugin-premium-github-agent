@@ -1182,10 +1182,15 @@ async function rebuildRebased(ctx: PluginContext, settings: Settings, conn: Conn
 
 /** The cron tick: reconcile runs and builds, then keep every unfinished stack moving. */
 async function stackTick(ctx: PluginContext): Promise<void> {
+	await poll(ctx);
+	await sweepStacks(ctx);
+}
+
+/** Keep every unfinished stack moving: rebased layers rebuild, the next layer starts, what is green merges. */
+async function sweepStacks(ctx: PluginContext): Promise<void> {
 	const setup = await requireSetup(ctx);
 	if (!setup.ok) return;
 	const { conn, settings } = setup;
-	await poll(ctx);
 	for (let stack of await listStacks(ctx, 20)) {
 		if (stack.status === "merged") continue;
 		for (const [key, entry] of Object.entries(stack.pendingRebuild ?? {})) {
@@ -1369,6 +1374,11 @@ const plugin: SandboxedPlugin = {
 			}
 			await ensureTick(ctx);
 			ctx.log.info("GitHub agent installed");
+		},
+
+		/** Updates re-activate the plugin: make sure the stack tick exists. */
+		"plugin:activate": async (_event, ctx) => {
+			await ensureTick(ctx);
 		},
 
 		/** Every two minutes: reconcile runs and builds, keep stacks moving (lost webhooks, merges left running on GitHub, rebased layers). */
@@ -1737,11 +1747,14 @@ const plugin: SandboxedPlugin = {
 			},
 		},
 
-		/** Manual reconcile: dispatch labelled issues not seen yet, refresh in-flight runs. */
+		/** Manual reconcile: refresh in-flight runs and builds, keep stacks moving; also (re)registers the stack tick. */
 		poll: {
 			handler: async (_routeCtx, ctx) => {
+				await ensureTick(ctx);
 				const r = await poll(ctx);
-				return { success: !r.error, ...r };
+				if (r.error) return { success: false, ...r };
+				await sweepStacks(ctx).catch((e) => ctx.log.error("stack sweep failed", e));
+				return { success: true, ...r };
 			},
 		},
 
