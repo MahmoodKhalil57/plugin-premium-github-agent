@@ -386,3 +386,10 @@ export async function closeIssue(ctx: PluginContext, conn: Connection, number: n
 	const r = await gh(ctx, conn, "PATCH", `/repos/${conn.owner}/${conn.repo}/issues/${number}`, { state: "closed", state_reason: "completed" });
 	if (!r.ok) throw new Error(`GitHub ${r.status} closing issue #${number}`);
 }
+
+/** Delete a branch (its static preview disappears with it). Missing branches are fine. */
+export async function deleteBranch(ctx: PluginContext, conn: Connection, branch: string): Promise<boolean> {
+	const r = await gh(ctx, conn, "DELETE", `/repos/${conn.owner}/${conn.repo}/git/refs/heads/${branch}`);
+	if (r.ok || r.status === 404 || r.status === 422) return r.ok;
+	throw new Error(`GitHub ${r.status} deleting branch ${branch}`);
+}

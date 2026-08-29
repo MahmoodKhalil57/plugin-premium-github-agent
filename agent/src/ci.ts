@@ -10,7 +10,7 @@
 
 import { getSandbox, type Sandbox } from "@cloudflare/sandbox";
 
-import { applyPlan, historyBranches, previousPreviewName, rotationPlan, type RefUpdate } from "./rotation.js";
+import { applyPlan, historyBranches, rotationPlan, type RefUpdate } from "./rotation.js";
 
 export interface CiInput {
 	owner: string;
@@ -28,10 +28,16 @@ export interface CiInput {
 	previewSecret: string;
 	siteUrl: string;
 	callbackUrl: string;
-	/** Host the passing build as a preview Worker (PR builds only). */
-	preview?: boolean;
-	/** Branch builds: keep this many previous deployments as `<staticBranch>-b-N` branches, each hosted as a preview Worker. */
+	/**
+	 * PR builds: where the platform serves `staticBranch` straight from the
+	 * repository (`https://<rn>--pr-N.premium-cms.com`). The run waits until
+	 * that URL serves the commit it pushed, then runs `test:preview:cf` there.
+	 */
+	previewUrl?: string | null;
+	/** Branch builds: keep this many previous deployments as `<staticBranch>-b-N` branches. */
 	previous?: number;
+	/** Branch builds: where the platform serves each kept deployment (`-b-1` first). */
+	previousUrls?: Array<string | null>;
 }
 
 /** An earlier deployment of a branch, kept on its own static branch. */
@@ -60,7 +66,7 @@ export interface CiResult {
 	build: StepResult | null;
 	push: StepResult | null;
 	test: StepResult | null;
-	/** Hosting the passing build on Cloudflare (assets-only Worker). */
+	/** The git-served preview answering with the pushed commit. */
 	preview: StepResult | null;
 	previewUrl: string | null;
 	/** `test:preview:cf` run against the live preview (PREVIEW_URL). */
@@ -69,18 +75,6 @@ export interface CiResult {
 	previous: PreviousDeployment[];
 	ok: boolean;
 	error?: string;
-}
-
-/** Cloudflare account that hosts PR previews (the platform's). */
-export interface PreviewHost {
-	accountId: string;
-	apiToken: string;
-}
-
-/** Worker name for a PR preview: stable per (repo, PR), valid for workers.dev. */
-export function previewWorkerName(owner: string, repo: string, pr: number): string {
-	const slug = `${owner}-${repo}`.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
-	return `preview-${slug.slice(0, 40).replace(/-+$/, "")}-pr${pr}`;
 }
 
 const LOG_TAIL = 6000;
@@ -106,17 +100,28 @@ async function step(
 	}
 }
 
-/** A fresh Worker takes a few seconds to answer on workers.dev; don't fail the suite on that. */
-async function waitForPreview(url: string): Promise<void> {
-	for (let i = 0; i < 12; i++) {
+/**
+ * The platform serves the static branch from git and caches by commit: wait
+ * until the preview answers with the commit this run pushed (`X-Preview-Commit`),
+ * so the tests run against these bytes and not the previous build's.
+ */
+export async function waitForPreview(url: string, commit: string | null, attempts = 24): Promise<StepResult> {
+	const t0 = Date.now();
+	let last = "";
+	for (let i = 0; i < attempts; i++) {
 		try {
-			const r = await fetch(url, { method: "GET", redirect: "manual" });
-			if (r.status < 500) return;
-		} catch {
-			/* not yet */
+			const r = await fetch(`${url.replace(/\/+$/, "")}/`, { method: "GET", redirect: "manual", headers: { "cache-control": "no-cache" } });
+			const served = r.headers.get("x-preview-commit") ?? "";
+			last = `${r.status} ${served ? `@ ${served.slice(0, 7)}` : "(no preview headers)"}`;
+			if (r.status < 500 && (!commit || served === commit)) {
+				return { ok: true, log: `${url} serves ${served ? served.slice(0, 7) : "the branch"}`, seconds: Math.round((Date.now() - t0) / 1000) };
+			}
+		} catch (e) {
+			last = String(e);
 		}
 		await new Promise((res) => setTimeout(res, 5000));
 	}
+	return { ok: false, log: `${url} did not serve ${commit?.slice(0, 7) ?? "the branch"} in time (last: ${last})`, seconds: Math.round((Date.now() - t0) / 1000) };
 }
 
 /** A transient platform condition (no container slot free right now). */
@@ -173,60 +178,6 @@ async function setRef(auth: RepoAuth, u: RefUpdate): Promise<void> {
 	throw new Error(`GitHub ${r.status} updating ${u.branch}: ${String(r.json?.message ?? "")}`);
 }
 
-/**
- * Host every previous deployment as its own assets-only Worker
- * (`preview-<repo>-<branch>-b-N`), straight from the branch that holds it.
- * Best-effort per slot: a failed slot keeps `previewUrl: null`.
- */
-async function deployPrevious(
-	sb: Sandbox,
-	input: CiInput,
-	host: PreviewHost,
-	previous: PreviousDeployment[],
-	gitEnv: Record<string, string>,
-	repoUrl: string,
-): Promise<StepResult> {
-	const t0 = Date.now();
-	const logs: string[] = [];
-	let ok = true;
-	for (const [i, p] of previous.entries()) {
-		const dir = `/workspace/previous-${i + 1}`;
-		const name = previousPreviewName(input.owner, input.repo, input.headRef, i + 1);
-		const clone = await step(
-			sb,
-			`rm -rf ${dir} && git clone -q --depth 1 --branch "${p.branch}" "${repoUrl}" ${dir} && rm -rf ${dir}/.git`,
-			{ cwd: "/workspace", env: gitEnv, timeout: 5 * 60_000 },
-		);
-		if (!clone.ok) {
-			ok = false;
-			logs.push(`${p.branch}: clone failed\n${clone.log}`);
-			continue;
-		}
-		await sb.writeFile(
-			`${dir}/wrangler.preview.jsonc`,
-			JSON.stringify({ name, compatibility_date: "2026-08-01", assets: { directory: "./" }, workers_dev: true }),
-		);
-		const deploy = await step(
-			sb,
-			"npx --yes wrangler@4 deploy --config wrangler.preview.jsonc 2>&1 | grep -viE 'api token|account id'",
-			{
-				cwd: dir,
-				env: { CLOUDFLARE_API_TOKEN: host.apiToken, CLOUDFLARE_ACCOUNT_ID: host.accountId, WRANGLER_SEND_METRICS: "false" },
-				timeout: 10 * 60_000,
-			},
-		);
-		const url = deploy.log.match(/https:\/\/[a-z0-9.-]+\.workers\.dev/)?.[0] ?? null;
-		if (!deploy.ok || !url) {
-			ok = false;
-			logs.push(`${p.branch}: deploy failed\n${deploy.log}`);
-			continue;
-		}
-		p.previewUrl = url;
-		logs.push(`${p.branch} @ ${p.sha.slice(0, 7)} → ${url} (${clone.seconds + deploy.seconds}s)`);
-	}
-	return { ok, log: tail(logs.join("\n")), seconds: Math.round((Date.now() - t0) / 1000) };
-}
-
 /** Stage names reported while a run progresses (each maps to a PR comment command). */
 export type CiStage = "check" | "test" | "preview" | "previewTest";
 export type StageReporter = (stage: CiStage, result: StepResult, extra?: { previewUrl?: string }) => Promise<void>;
@@ -234,7 +185,6 @@ export type StageReporter = (stage: CiStage, result: StepResult, extra?: { previ
 export async function runCi(
 	ns: DurableObjectNamespace<Sandbox>,
 	input: CiInput,
-	host: PreviewHost | null,
 	report: StageReporter = async () => undefined,
 ): Promise<CiResult> {
 	const out: CiResult = {
@@ -361,9 +311,9 @@ export async function runCi(
 		out.staticSha = out.push.log.match(/^[0-9a-f]{40}$/m)?.[0] ?? null;
 		out.previous = names.slice(1).flatMap((branch, i) => {
 			const sha = history[i + 1];
-			return sha ? [{ branch, sha, previewUrl: null }] : [];
+			// Served straight from the branch by the platform: the URL is the plugin's to know.
+			return sha ? [{ branch, sha, previewUrl: input.previousUrls?.[i] ?? null }] : [];
 		});
-		if (host && out.previous.length) out.preview = await deployPrevious(sb, input, host, out.previous, gitEnv, repoUrl);
 		await report("check", {
 			ok: true,
 			log: `check:cf ${out.check.seconds}s · build ${out.build.seconds}s · ${input.staticBranch} @ ${out.staticSha?.slice(0, 7) ?? "?"}`,
@@ -377,36 +327,21 @@ export async function runCi(
 			return out;
 		}
 
-		// Tests passed: host the exact bytes that went to the static branch as an
-		// assets-only Worker on the platform account. The config never touches
-		// the static branch (it is written after the push).
-		if (host && input.preview !== false && input.pr > 0) {
-			const name = previewWorkerName(input.owner, input.repo, input.pr);
-			await sb.writeFile(
-				`${OUT}/wrangler.preview.jsonc`,
-				JSON.stringify({ name, compatibility_date: "2026-08-01", assets: { directory: "./" }, workers_dev: true }),
-			);
-			out.preview = await step(
-				sb,
-				"rm -rf .git && npx --yes wrangler@4 deploy --config wrangler.preview.jsonc 2>&1 | grep -viE 'api token|account id'",
-				{
-					cwd: OUT,
-					env: { CLOUDFLARE_API_TOKEN: host.apiToken, CLOUDFLARE_ACCOUNT_ID: host.accountId, WRANGLER_SEND_METRICS: "false" },
-					timeout: 10 * 60_000,
-				},
-			);
-			const url = out.preview.log.match(/https:\/\/[a-z0-9.-]+\.workers\.dev/)?.[0] ?? null;
-			if (!out.preview.ok || !url) {
-				out.error = "preview deploy failed";
-				await report("preview", { ...out.preview, ok: false });
+		// Tests passed. The platform serves the static branch straight from git;
+		// wait until it answers with the commit just pushed, then the project's own
+		// end-to-end suite runs against it (Playwright, Browser Rendering, plain
+		// fetch — the script decides).
+		if (input.pr > 0 && input.previewUrl) {
+			const url = input.previewUrl;
+			out.preview = await waitForPreview(url, out.staticSha);
+			if (!out.preview.ok) {
+				out.error = "preview not served";
+				await report("preview", out.preview);
 				return out;
 			}
 			out.previewUrl = url;
 			await report("preview", out.preview, { previewUrl: url });
 
-			// The preview is live: the project's own end-to-end suite runs against
-			// it (Playwright, Browser Rendering, plain fetch — the script decides).
-			await waitForPreview(url);
 			out.previewTest = await step(sb, "npm run --if-present test:preview:cf", {
 				cwd: WORK,
 				env: { PREVIEW_URL: url },

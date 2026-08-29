@@ -92,7 +92,7 @@ export interface CiStep {
 	seconds: number;
 }
 
-/** An earlier deployment of the default branch, kept on `static/<branch>-b-N` and hosted as a preview Worker. */
+/** An earlier deployment of the default branch, kept on `static/<branch>-b-N` and served from there by the platform. */
 export interface PreviousDeployment {
 	branch: string;
 	sha: string;
@@ -171,13 +171,6 @@ export function canonicalStage(r: CiStageReport): string {
 	});
 }
 
-/** Remove a PR's preview Worker (best-effort, when the PR closes). */
-export async function deletePreview(ctx: PluginContext, settings: Settings, conn: Connection, pr: number): Promise<boolean> {
-	const q = new URLSearchParams({ owner: conn.owner, repo: conn.repo, pr: String(pr) });
-	const r = await call(ctx, settings, "DELETE", `/preview?${q}`);
-	return r.ok && r.json.deleted === true;
-}
-
 /** Start a PR build; the worker accepts it and POSTs the result to `ci-callback` when done. */
 export async function dispatchCi(
 	ctx: PluginContext,
@@ -192,9 +185,12 @@ export async function dispatchCi(
 		backendUrl: string;
 		siteUrl: string;
 		callbackUrl: string;
-		preview?: boolean;
+		/** PR builds: the platform's git-served URL of the static branch; the run waits for it, then tests against it. */
+		previewUrl?: string | null;
 		/** Branch builds: how many previous deployments to keep (`static/<branch>-b-N`). */
 		previous?: number;
+		/** Branch builds: the platform's URL for each kept deployment (`-b-1` first). */
+		previousUrls?: Array<string | null>;
 	},
 ): Promise<void> {
 	const r = await call(ctx, settings, "POST", "/ci", {

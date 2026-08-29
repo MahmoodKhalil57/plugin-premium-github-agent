@@ -15,7 +15,7 @@ import { skills } from "@cloudflare/think";
 
 import { Sandbox } from "@cloudflare/sandbox";
 
-import { isCapacityError, previewWorkerName, runCi, type CiInput, type CiStage, type StepResult } from "./ci.js";
+import { isCapacityError, runCi, type CiInput, type CiStage, type StepResult } from "./ci.js";
 import { loadRepoContext, type RepoContext } from "./repo-context.js";
 import { FIX_ISSUE_SKILL } from "./skill.js";
 
@@ -29,9 +29,6 @@ interface Env {
 	AGENT_KEY: string;
 	/** Default model; `run` may override per request. */
 	MODEL?: string;
-	/** Platform Cloudflare account that hosts PR previews (assets-only Workers). */
-	CF_ACCOUNT_ID?: string;
-	CF_API_TOKEN?: string;
 }
 
 const GITHUB_MCP = "https://api.githubcopilot.com/mcp/";
@@ -242,10 +239,6 @@ export class IssueFixer extends Think<Env> {
 	}
 
 	async ciJob(input: CiInput & { waits?: number }): Promise<void> {
-		const host =
-			this.env.CF_ACCOUNT_ID && this.env.CF_API_TOKEN
-				? { accountId: this.env.CF_ACCOUNT_ID, apiToken: this.env.CF_API_TOKEN }
-				: null;
 		await this.ctx.storage.put("ci:running", { attempt: input.attempt, startedAt: new Date().toISOString() });
 		const stageUrl = input.callbackUrl.replace(/ci-callback$/, "ci-stage");
 		const report = async (stage: CiStage, r: StepResult, extra?: { previewUrl?: string }) => {
@@ -272,7 +265,7 @@ export class IssueFixer extends Think<Env> {
 				body,
 			}).catch(() => undefined);
 		};
-		const result = await runCi(this.env.Sandbox, input, host, input.pr > 0 ? report : undefined);
+		const result = await runCi(this.env.Sandbox, input, input.pr > 0 ? report : undefined);
 		// No container slot: wait for one instead of failing the build (up to ~30 min).
 		if (!result.ok && isCapacityError(result.error) && (input.waits ?? 0) < 30) {
 			await this.schedule(60, "ciJob", { ...input, waits: (input.waits ?? 0) + 1 });
@@ -447,8 +440,9 @@ export default {
 				previewSecret: typeof body.previewSecret === "string" ? body.previewSecret : "",
 				siteUrl: body.siteUrl!,
 				callbackUrl: body.callbackUrl!,
-				preview: body.preview !== false,
+				previewUrl: typeof body.previewUrl === "string" && /^https:\/\//.test(body.previewUrl) ? body.previewUrl : null,
 				previous: typeof body.previous === "number" ? body.previous : 0,
+				previousUrls: Array.isArray(body.previousUrls) ? body.previousUrls.map((u) => (typeof u === "string" && /^https:\/\//.test(u) ? u : null)) : undefined,
 			};
 			const key = input.pr > 0 ? nameFor(input.owner, input.repo, input.pr) : `${input.owner}/${input.repo}@${input.headRef}`.toLowerCase();
 			const agent = await getAgentByName(env.IssueFixer, `ci:${key}`);
@@ -476,21 +470,6 @@ export default {
 			const key = pr > 0 ? nameFor(owner, repo, pr) : `${owner}/${repo}@${branch}`.toLowerCase();
 			const agent = await getAgentByName(env.IssueFixer, `ci:${key}`);
 			return json(await agent.ciStatus());
-		}
-
-		// Remove a PR's preview Worker (the PR was closed or merged).
-		if (request.method === "DELETE" && url.pathname === "/preview") {
-			const owner = url.searchParams.get("owner") ?? "";
-			const repo = url.searchParams.get("repo") ?? "";
-			const pr = Number(url.searchParams.get("pr"));
-			if (!owner || !repo || !Number.isInteger(pr)) return json({ error: "owner, repo, pr required" }, 400);
-			if (!env.CF_ACCOUNT_ID || !env.CF_API_TOKEN) return json({ error: "previews are not configured" }, 501);
-			const name = previewWorkerName(owner, repo, pr);
-			const r = await fetch(
-				`https://api.cloudflare.com/client/v4/accounts/${env.CF_ACCOUNT_ID}/workers/scripts/${name}`,
-				{ method: "DELETE", headers: { Authorization: `Bearer ${env.CF_API_TOKEN}` } },
-			);
-			return json({ name, deleted: r.ok || r.status === 404 });
 		}
 
 		if (request.method === "GET" && url.pathname === "/transcript") {

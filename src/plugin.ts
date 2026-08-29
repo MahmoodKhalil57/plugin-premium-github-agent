@@ -23,9 +23,11 @@
  *             No code is ever executed — dry coding only.
  *   site      pushes to the default branch and content publishes rebuild
  *             `static/<branch>` (what GitHub Pages serves). The two previous
- *             deployments stay on `static/<branch>-b-1` / `-b-2`, each hosted
- *             as its own preview Worker, so "live", one back and two back are
- *             always there.
+ *             deployments stay on `static/<branch>-b-1` / `-b-2`.
+ *   previews  every static branch is served straight from the repository by
+ *             the platform at `https://<rn>--<label>.<platform zone>` —
+ *             `pr-12` for a PR's `static/pr-12`, `main-b-1` for a kept
+ *             deployment. No Worker, no bucket: the branch is the preview.
  *   storage   `runs` — one row per issue the agent was asked about;
  *             `builds` — one row per PR / built branch; `stacks` — one row
  *             per stack of layers.
@@ -44,7 +46,6 @@ import {
 	canonicalCi,
 	canonicalStage,
 	ciStatus,
-	deletePreview,
 	dispatch,
 	dispatchCi,
 	hmacHex,
@@ -68,6 +69,7 @@ import {
 	comment,
 	createGitHubStack,
 	createIssue,
+	deleteBranch,
 	getConnection,
 	getIssue,
 	getPull,
@@ -396,6 +398,30 @@ function staticBranchFor(headRef: string): string {
 	return `static/${headRef}`;
 }
 
+/** A pull request's static branch: named by number, so its preview label is stable across pushes and renames. */
+function prStaticBranch(pr: number): string {
+	return `static/pr-${pr}`;
+}
+
+/**
+ * The platform serves `static/<label>` at `https://<rn>--<label>.<zone>`, where
+ * `<rn>.<zone>` is the site's platform origin (`ctx.site.platformUrl`). Null
+ * on sites that are not hosted by a control plane.
+ */
+function previewUrlFor(ctx: PluginContext, label: string): string | null {
+	const platform = (ctx.site as { platformUrl?: string }).platformUrl;
+	if (!platform) return null;
+	let host = "";
+	try {
+		host = new URL(platform).hostname.toLowerCase();
+	} catch {
+		return null;
+	}
+	const dot = host.indexOf(".");
+	if (dot <= 0 || !/^[a-z0-9][a-z0-9-]{0,40}$/.test(label)) return null;
+	return `https://${host.slice(0, dot)}--${label}${host.slice(dot)}`;
+}
+
 function ciCallbackUrl(ctx: PluginContext): string {
 	return `${ctx.site.url.replace(/\/+$/, "")}${CI_CALLBACK_PATH}`;
 }
@@ -475,7 +501,7 @@ async function buildPull(
 		author: pr.author,
 		headRef: pr.headRef,
 		headSha: pr.headSha,
-		staticBranch: existing?.staticBranch ?? staticBranchFor(pr.headRef),
+		staticBranch: prStaticBranch(pr.number),
 		staticSha: existing?.staticSha,
 		attempt,
 		status: "running",
@@ -503,6 +529,7 @@ async function buildPull(
 			backendUrl: ctx.site.url,
 			siteUrl: ctx.site.url,
 			callbackUrl: ciCallbackUrl(ctx),
+			previewUrl: previewUrlFor(ctx, `pr-${pr.number}`),
 		});
 		return { started: true, build };
 	} catch (error) {
@@ -658,8 +685,8 @@ async function buildDefaultBranch(
 			backendUrl: ctx.site.url,
 			siteUrl: ctx.site.url,
 			callbackUrl: ciCallbackUrl(ctx),
-			preview: false,
 			previous: PREVIOUS_DEPLOYMENTS,
+			previousUrls: Array.from({ length: PREVIOUS_DEPLOYMENTS }, (_, i) => previewUrlFor(ctx, `${branch}-b-${i + 1}`)),
 		});
 		return { started: true };
 	} catch (error) {
@@ -1431,7 +1458,8 @@ const plugin: SandboxedPlugin = {
 
 				// Pull requests: a layer GitHub rebased after a merge below it is
 				// rebuilt; a layer linked by hand records its stack; closed PRs drop
-				// their preview. Nothing else about PRs is implicit.
+				// their static branch (and with it their preview). Nothing else
+				// about PRs is implicit.
 				const pull = pullFromEvent(input);
 				if (pull) {
 					if (pull.action === "synchronize") {
@@ -1460,14 +1488,15 @@ const plugin: SandboxedPlugin = {
 					const build = await getBuild(ctx, pull.number);
 					const merged = build?.status === "merged" || pull.merged;
 					if (build) {
-						const deleted = build.previewUrl
-							? await deletePreview(ctx, setup.settings, setup.conn, pull.number).catch(() => false)
+						// The preview is the static branch: deleting it is deleting the preview.
+						const deleted = build.staticBranch.startsWith("static/pr-")
+							? await deleteBranch(ctx, setup.conn, build.staticBranch).catch(() => false)
 							: false;
 						await putBuild(ctx, {
 							...build,
 							status: merged ? "merged" : "closed",
 							previewUrl: undefined,
-							summary: `${build.status === "merged" ? build.summary : merged ? `merged into ${setup.conn.branch}` : "closed"}; preview ${deleted ? "removed" : "not removed"}`,
+							summary: `${build.status === "merged" ? build.summary : merged ? `merged into ${setup.conn.branch}` : "closed"}; ${deleted ? `${build.staticBranch} deleted` : "static branch kept"}`,
 						});
 					}
 					// A layer closed without merging blocks the layers above: let the stack take note.
@@ -1959,7 +1988,7 @@ async function buildPage(ctx: PluginContext, notice?: string) {
 			type: "table",
 			block_id: "deployments",
 			page_action_id: "deployments_page",
-			empty_text: `No previous deployments kept yet — each build keeps the last ${PREVIOUS_DEPLOYMENTS} on ${staticBranchFor(conn.branch)}-b-1 … -b-${PREVIOUS_DEPLOYMENTS}, each with its own preview URL.`,
+			empty_text: `No previous deployments kept yet — each build keeps the last ${PREVIOUS_DEPLOYMENTS} on ${staticBranchFor(conn.branch)}-b-1 … -b-${PREVIOUS_DEPLOYMENTS}, each served at its own preview URL.`,
 			columns: [
 				{ key: "slot", label: "Deployment", format: "text" },
 				{ key: "branch", label: "Branch", format: "code" },
@@ -2004,7 +2033,7 @@ async function buildPage(ctx: PluginContext, notice?: string) {
 		});
 		const builds = await listBuilds(ctx, 30);
 		blocks.push({ type: "divider" });
-		blocks.push({ type: "section", text: "Pull requests built by the platform after /awaiting-test (check:cf → build → static branch → test:cf → Cloudflare preview → test:preview:cf → /merged)." });
+		blocks.push({ type: "section", text: "Pull requests built by the platform after /awaiting-test (check:cf → build → static/pr-N → test:cf → preview served from that branch → test:preview:cf → /merged)." });
 		blocks.push({
 			type: "table",
 			block_id: "pulls",
@@ -2227,7 +2256,7 @@ async function buildDeploymentsWidget(ctx: PluginContext) {
 	if (pagesUrl && site?.staticSha) fields.push({ label: "GitHub Pages origin", value: withoutScheme(pagesUrl), url: pagesUrl });
 	const blocks: unknown[] = [{ type: "fields", fields }];
 	if (!site) {
-		blocks.push({ type: "context", text: `Not built by the platform yet — pushes to ${conn.branch} and content publishes build it to ${staticBranchFor(conn.branch)}; the two previous deployments then stay on ${staticBranchFor(conn.branch)}-b-1 / -b-2 with their own preview URLs.` });
+		blocks.push({ type: "context", text: `Not built by the platform yet — pushes to ${conn.branch} and content publishes build it to ${staticBranchFor(conn.branch)}; the two previous deployments then stay on ${staticBranchFor(conn.branch)}-b-1 / -b-2, each served at its own preview URL.` });
 	} else if (site.status === "running") {
 		blocks.push({ type: "context", text: `Building ${conn.branch} (attempt ${site.attempt})…` });
 	}

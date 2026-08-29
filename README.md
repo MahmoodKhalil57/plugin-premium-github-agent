@@ -89,6 +89,29 @@ Layer discipline is the same as GitHub's advice for AI-generated code: order
 by dependency (foundation first), keep each layer small and reviewable, and
 put independent changes in separate stacks or plain issues.
 
+## Previews come straight from git
+
+Every static branch the CI pushes is a preview, with no hosting of its own.
+The platform zone has a wildcard record and the router forwards
+`https://<rn>--<label>.premium-cms.com` to the instance `<rn>` with
+`X-Premium-Preview: <label>`; the instance serves `static/<label>` from the
+repository through the site's own GitHub connection (cached at the edge by
+commit; every response carries `X-Preview-Commit`, is `noindex`, and `/_emdash/*`
+answers 404 — a preview is the static site only). So:
+
+| Branch | Preview |
+| --- | --- |
+| `static/pr-12` (a PR build; deleted when the PR closes) | `https://<rn>--pr-12.premium-cms.com` |
+| `static/main-b-1`, `-b-2` (kept deployments) | `https://<rn>--main-b-1.premium-cms.com` |
+| `static/main` (what GitHub Pages serves live) | `https://<rn>--main.premium-cms.com` |
+
+`<rn>` is the site's platform name (`ctx.site.platformUrl`, `https://p<ulid>.premium-cms.com`),
+so previews stay on the platform zone even when the site uses a custom domain.
+The CI waits until the preview serves the commit it pushed before running
+`test:preview:cf` against it. Nothing runs or is stored outside the instance
+and the repository: no preview Workers, no bucket, no Cloudflare credentials
+in the CI.
+
 ## Default branch: live, one back, two back
 
 Every successful build of the default branch is a deployment. Before the new

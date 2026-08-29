@@ -51,7 +51,7 @@ function ctxWith(opts: {
 		},
 		cron: { schedule: async (name: string) => void crons.push(name) },
 		github: opts.github === undefined ? undefined : { get: async () => opts.github },
-		site: { name: "Site", url: "https://site.example", locale: "en" },
+		site: { name: "Site", url: "https://site.example", locale: "en", platformUrl: "https://p01abcdefghijklmnopqrstuvwxy.premium-cms.com" },
 		http: {
 			fetch: async (url: string, init?: RequestInit) => {
 				calls.push({ url, init });
@@ -172,7 +172,7 @@ describe("/awaiting-test and the runner's reports", () => {
 		const r = (await route("webhook")(commentEvent(10, "alice", "Changed the footer.\n/awaiting-test", true), ctx)) as { handled: Record<string, { started: boolean }> };
 		expect(r.handled["awaiting-test"].started).toBe(true);
 		const ci = JSON.parse(String(calls.find((c) => c.url.endsWith("/ci"))?.init?.body));
-		expect(ci).toMatchObject({ pr: 10, headRef: "agent/issue-1-x", staticBranch: "static/agent/issue-1-x", attempt: 1 });
+		expect(ci).toMatchObject({ pr: 10, headRef: "agent/issue-1-x", staticBranch: "static/pr-10", attempt: 1, previewUrl: "https://p01abcdefghijklmnopqrstuvwxy--pr-10.premium-cms.com" });
 
 		const stage = (stage: string, ok: boolean, previewUrl: string | null = null) =>
 			signed({ pr: 10, branch: "agent/issue-1-x", attempt: 1, headSha: "abc1234", stage, ok, log: ok ? "" : "boom", seconds: 2, previewUrl }, canonicalStage);
@@ -269,23 +269,24 @@ describe("/awaiting-test and the runner's reports", () => {
 		expect(commentsPosted(calls, 1)).toEqual([]);
 	});
 
-	it("removes the preview when the PR closes", async () => {
+	it("deletes the PR's static branch — its preview — when the PR closes", async () => {
 		const { ctx, builds, calls } = ctxWith({
 			github: conn,
 			settings: { ...settings, autoMerge: false },
 			fetch: async (url, init) => {
 				if (url.endsWith("/pulls/14")) return Response.json(pull(14, "alice", "feature"));
 				if (url.endsWith("/ci")) return Response.json({ accepted: true }, { status: 202 });
-				if (url.includes("/preview?") && init?.method === "DELETE") return Response.json({ deleted: true });
+				if (url.endsWith("/git/refs/heads/static/pr-14") && init?.method === "DELETE") return new Response(null, { status: 204 });
 				return Response.json({});
 			},
 		});
 		await route("webhook")(commentEvent(14, "alice", "/awaiting-test", true), ctx);
 		await route("ci-callback")(await signed(ciResult(14, 1, true), canonicalCi), ctx);
-		expect(builds.get("14")?.status).toBe("passed");
+		expect(builds.get("14")).toMatchObject({ status: "passed", staticBranch: "static/pr-14" });
 		await route("webhook")({ input: { action: "closed", pull_request: pull(14, "alice", "feature"), repository: { full_name: "acme/site" } } }, ctx);
-		expect(builds.get("14")).toMatchObject({ status: "closed" });
-		expect(calls.some((c) => c.url.includes("/preview?") && c.init?.method === "DELETE")).toBe(true);
+		expect(builds.get("14")).toMatchObject({ status: "closed", summary: expect.stringContaining("static/pr-14 deleted") });
+		expect(calls.some((c) => c.url.endsWith("/git/refs/heads/static/pr-14") && c.init?.method === "DELETE")).toBe(true);
+		expect(calls.some((c) => c.url.includes("/preview?"))).toBe(false);
 	});
 });
 
@@ -348,7 +349,7 @@ describe("default branch", () => {
 		const r = (await route("webhook")({ input: { ref: "refs/heads/main", after: "mainsha", repository: { full_name: "acme/site" } } }, ctx)) as { started: boolean };
 		expect(r.started).toBe(true);
 		const ci = JSON.parse(String(calls.find((c) => c.url.endsWith("/ci"))?.init?.body));
-		expect(ci).toMatchObject({ pr: 0, headRef: "main", staticBranch: "static/main", preview: false, previous: 2 });
+		expect(ci).toMatchObject({ pr: 0, headRef: "main", staticBranch: "static/main", previousUrls: ["https://p01abcdefghijklmnopqrstuvwxy--main-b-1.premium-cms.com", "https://p01abcdefghijklmnopqrstuvwxy--main-b-2.premium-cms.com"], previous: 2 });
 		await route("ci-callback")(await signed(branchResult(1, true), canonicalCi), ctx);
 		expect(builds.get("branch:main")).toMatchObject({ status: "passed", staticSha: "stat123" });
 		expect(pagesCalls).toEqual([{ method: "PUT", body: { build_type: "legacy", source: { branch: "static/main", path: "/" } } }]);
