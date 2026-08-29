@@ -23,6 +23,8 @@ Everything is driven by `/commands` in issue and pull-request comments, from
 | Who      | Command                                    | Effect |
 | -------- | ------------------------------------------ | ------ |
 | you      | `/agent-issue` (issue body or comment)     | the agent studies the repo, opens a fix PR, and comments `/awaiting-test` on it |
+| you      | `/agent-stack #12 #13 …` (any issue), or bare `/agent-stack` on an issue with sub-issues | the issues run as stacked layers, bottom first — see below |
+| you      | `/agent-issue on #12`                      | this issue becomes one more layer on top of #12's stack (or its PR) |
 | you/agent| `/awaiting-test` (PR comment)              | the platform runs the checks on the PR head |
 | runner   | `/check-succeeded` · `/check-failed`       | `check:cf` + `astro build` + push to `static/<branch>` |
 | runner   | `/test-succeeded` · `/test-failed`         | `test:cf` |
@@ -36,6 +38,56 @@ back to the agent, which pushes a fix to the same branch and comments
 human's PR are informational; `/…-succeeded` never triggers anything. Pushes
 to the default branch and content publishes rebuild `static/<default>` without
 any comment.
+
+## Stacked pull requests: several issues, one branching strategy
+
+Several related changes — dependent on each other, or touching the same
+files — should not be a queue of independent PRs (slow, or a merge-conflict
+lottery when run in parallel) or one huge issue. Run them as a **stack**,
+GitHub's native stacked pull requests (public preview):
+
+```
+/agent-stack #12 #13 #14      ← on any issue: the listed issues, bottom first
+/agent-stack                  ← on an issue with sub-issues: those, in their order
+/agent-issue on #12           ← one more layer on top of #12's stack (or its PR)
+```
+
+(The MCP tools `create_stack` and `create_issue` with `on` do the same for
+assistants; the admin page has a "Start stack" form.)
+
+What happens, bottom-up:
+
+1. **Layer 1** runs as usual: a branch from the default branch, a pull request,
+   `/awaiting-test`.
+2. **Each next layer starts the moment the layer below opens its pull
+   request** — not after its checks or merge — from that PR's branch, and opens
+   its PR *against that branch*. Dependent code always sees the code it depends
+   on; nothing conflicts, nothing waits for a merge.
+3. The plugin links the PRs as a GitHub stack (`POST /repos/…/stacks`, then
+   `/stacks/{n}/add`); every PR shows the stack map on GitHub and is built,
+   previewed and tested by the platform like any other.
+4. **Merging is bottom-up and atomic**: whenever the lowest open layer is green,
+   the longest run of green layers above it merges in one GitHub stack merge
+   (`PUT …/pulls/{n}/merge-async`, squash). The merge is held while the layer
+   right above is building (or just opened and about to build) and while a
+   planned layer has no PR yet, so GitHub never rebases a layer mid-build.
+5. After a partial merge GitHub rebases and retargets the remaining layers; the
+   plugin rebuilds each one as soon as its branch moves (`pull_request
+   synchronize`, with a two-minute cron tick as the safety net). A layer whose
+   build had failed is left to the agent's fix — its `/awaiting-test` builds it.
+6. Each merged layer gets `/merged`, its issue is closed, and the default
+   branch rebuilds.
+
+A layer that produces no pull request **stops the stack**: the layers below
+keep their life (they still merge when green), the layers above are not
+started, and every unstarted issue gets a comment with the `/agent-stack …`
+command to resume. A closed-unmerged layer blocks the layers above it, as on
+GitHub. Stacks show on the admin page (layers, PRs, what the stack is waiting
+for); `issue_status` reports the stack of an issue.
+
+Layer discipline is the same as GitHub's advice for AI-generated code: order
+by dependency (foundation first), keep each layer small and reviewable, and
+put independent changes in separate stacks or plain issues.
 
 ## Default branch: live, one back, two back
 

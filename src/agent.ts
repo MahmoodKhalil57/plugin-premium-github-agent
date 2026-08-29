@@ -9,7 +9,14 @@ import type { PluginContext } from "@premium-cms/emdash/plugin";
 import type { Connection } from "./github.js";
 import type { Settings } from "./settings.js";
 
-export type RunStatus = "queued" | "running" | "completed" | "error" | "skipped";
+export type RunStatus = "waiting" | "queued" | "running" | "completed" | "error" | "skipped";
+
+/** The layer below a stacked run: the agent branches from its pull request's branch. */
+export interface LayerBelow {
+	issue: number;
+	pr: number;
+	branch: string;
+}
 
 export interface Run {
 	number: number;
@@ -23,7 +30,21 @@ export interface Run {
 	reason?: string;
 	/** How many times the agent was asked about this issue. */
 	attempt?: number;
+	/** The stack this run is a layer of (`waiting` until the layer below opens its PR). */
+	stack?: string;
+	layer?: number;
+	/** Stacked layers above the bottom: the branch the agent starts from and targets. */
+	base?: string;
+	below?: LayerBelow;
 	updatedAt: string;
+}
+
+/** Stack placement handed to the worker with a run. */
+export interface StackedRun {
+	layer: number;
+	size: number;
+	base?: string;
+	below?: LayerBelow;
 }
 
 /** What the agent worker POSTs to `agent-callback` when a run ends. */
@@ -196,6 +217,7 @@ export async function dispatch(
 	attempt: number,
 	callbackUrl: string,
 	note?: string,
+	stacked?: StackedRun,
 ): Promise<{ submissionId: string; accepted: boolean }> {
 	const r = await call(ctx, settings, "POST", "/run", {
 		owner: conn.owner,
@@ -208,6 +230,7 @@ export async function dispatch(
 		attempt,
 		callbackUrl,
 		...(note ? { note } : {}),
+		...(stacked ? { base: stacked.base, stack: { layer: stacked.layer, size: stacked.size, below: stacked.below } } : {}),
 	});
 	if (!r.ok || typeof r.json.submissionId !== "string") {
 		throw new Error(`agent ${r.status}: ${String(r.json.error ?? "no submission id")}`);

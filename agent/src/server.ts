@@ -54,6 +54,9 @@ export interface RunInput {
 	callbackUrl?: string;
 	/** Extra context for this attempt, e.g. the failing CI log. */
 	note?: string;
+	/** Stacked layers above the bottom: the branch to start from and to open the PR against. */
+	base?: string;
+	stack?: { layer: number; size: number; below?: { issue: number; pr: number; branch: string } };
 }
 
 interface Watch {
@@ -157,6 +160,11 @@ export class IssueFixer extends Think<Env> {
 			.join("\n");
 
 		const attempt = Math.max(1, Math.floor(input.attempt ?? 1));
+		const stackLine = input.stack
+			? input.base && input.stack.below
+				? `Stacked pull requests: this issue is layer ${input.stack.layer} of ${input.stack.size}. Create your branch from \`${input.base}\` — the branch of pull request #${input.stack.below.pr}, which implements #${input.stack.below.issue} and is not merged yet — instead of the default branch, and open your pull request against \`${input.base}\` (base), not against ${input.branch}. Build on what is already there; do not rework what #${input.stack.below.issue} changed unless this issue requires it. The platform links the pull request into the stack and merges the stack bottom-up — do not merge, retarget or rebase anything.`
+				: `Stacked pull requests: this issue is layer ${input.stack.layer} of ${input.stack.size} and starts from the default branch as usual; the layers above will build on your branch, so keep the change self-contained and do not touch what they are meant to do.`
+			: "";
 		const text = [
 			`Repository: ${input.owner}/${input.repo} (default branch: ${input.branch})`,
 			`Issue: #${input.issue}`,
@@ -164,6 +172,7 @@ export class IssueFixer extends Think<Env> {
 			attempt > 1
 				? `This is attempt ${attempt}. Re-read the issue and the repository state (branches and pull requests you opened earlier may exist — reuse or correct them rather than duplicating). Fix this issue and open or update a pull request. Do not merge it.`
 				: "Fix this issue and open a pull request. Do not merge it.",
+			...(stackLine ? ["", stackLine] : []),
 			...(contextLine ? ["", contextLine] : []),
 			...(input.note ? ["", input.note] : []),
 		].join("\n");
@@ -360,6 +369,20 @@ function json(data: unknown, status = 200): Response {
 	});
 }
 
+function stackInput(raw: unknown): RunInput["stack"] {
+	if (!raw || typeof raw !== "object") return undefined;
+	const s = raw as { layer?: unknown; size?: unknown; below?: unknown };
+	const layer = Number(s.layer);
+	const size = Number(s.size);
+	if (!Number.isInteger(layer) || layer < 1 || !Number.isInteger(size) || size < 1) return undefined;
+	const b = s.below && typeof s.below === "object" ? (s.below as { issue?: unknown; pr?: unknown; branch?: unknown }) : null;
+	const below =
+		b && Number.isInteger(Number(b.issue)) && Number.isInteger(Number(b.pr)) && typeof b.branch === "string" && b.branch
+			? { issue: Number(b.issue), pr: Number(b.pr), branch: b.branch }
+			: undefined;
+	return { layer, size, below };
+}
+
 function nameFor(owner: string, repo: string, issue: number): string {
 	return `${owner}/${repo}#${issue}`.toLowerCase();
 }
@@ -397,6 +420,8 @@ export default {
 				attempt: typeof body.attempt === "number" ? body.attempt : 1,
 				callbackUrl: typeof body.callbackUrl === "string" ? body.callbackUrl : undefined,
 				note: typeof body.note === "string" ? body.note.slice(0, 12_000) : undefined,
+				base: typeof body.base === "string" && body.base ? body.base : undefined,
+				stack: stackInput(body.stack),
 			});
 			return json(out);
 		}

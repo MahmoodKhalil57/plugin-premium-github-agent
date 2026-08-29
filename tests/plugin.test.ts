@@ -10,6 +10,7 @@ import { describe, expect, it } from "vitest";
 import { canonicalCallback, canonicalCi, canonicalStage, hmacHex } from "../src/agent.js";
 import plugin from "../src/plugin.js";
 import { parseUsers } from "../src/settings.js";
+import { decideMerge, issueRefs, prNumberFrom, stackOnArg } from "../src/stacks.js";
 
 type Handler = (event: unknown, ctx: unknown) => Promise<unknown>;
 const route = (name: string) => (plugin.routes![name] as { handler: Handler }).handler;
@@ -22,7 +23,9 @@ function ctxWith(opts: {
 	const kv = new Map<string, unknown>(Object.entries(opts.settings ?? {}).map(([k, v]) => [`settings:${k}`, v]));
 	const store = new Map<string, Record<string, unknown>>();
 	const builds = new Map<string, Record<string, unknown>>();
+	const stacks = new Map<string, Record<string, unknown>>();
 	const calls: Array<{ url: string; init?: RequestInit }> = [];
+	const crons: string[] = [];
 	const ctx = {
 		kv: {
 			get: async (k: string) => kv.get(k) ?? null,
@@ -40,7 +43,13 @@ function ctxWith(opts: {
 				put: async (id: string, data: Record<string, unknown>) => void builds.set(id, data),
 				query: async () => ({ items: [...builds.entries()].map(([id, data]) => ({ id, data })), hasMore: false }),
 			},
+			stacks: {
+				get: async (id: string) => stacks.get(id) ?? null,
+				put: async (id: string, data: Record<string, unknown>) => void stacks.set(id, data),
+				query: async () => ({ items: [...stacks.entries()].map(([id, data]) => ({ id, data })), hasMore: false }),
+			},
 		},
+		cron: { schedule: async (name: string) => void crons.push(name) },
 		github: opts.github === undefined ? undefined : { get: async () => opts.github },
 		site: { name: "Site", url: "https://site.example", locale: "en" },
 		http: {
@@ -51,7 +60,7 @@ function ctxWith(opts: {
 		},
 		log: { debug() {}, info() {}, warn() {}, error() {} },
 	};
-	return { ctx, store, builds, calls };
+	return { ctx, store, builds, stacks, calls, crons };
 }
 
 const conn = { token: "gho_x", owner: "acme", repo: "site", branch: "main", previewSecret: "prev" };
@@ -283,7 +292,7 @@ describe("/awaiting-test and the runner's reports", () => {
 describe("MCP tools for assistants", () => {
 	it("declares create/list/status tools over author-level routes", () => {
 		const tools = (plugin as { mcp?: { tools: Record<string, { route: string }> } }).mcp?.tools ?? {};
-		expect(Object.keys(tools).sort()).toEqual(["create_issue", "issue_status", "list_issues"]);
+		expect(Object.keys(tools).sort()).toEqual(["create_issue", "create_stack", "issue_status", "list_issues"]);
 		for (const t of Object.values(tools)) {
 			expect((plugin.routes![t.route] as { permission?: string }).permission).toBe("content:edit_own");
 		}
@@ -434,5 +443,283 @@ describe("default branch", () => {
 		expect(ciCalls).toBe(1);
 		await route("ci-callback")(await signed(branchResult(1, true), canonicalCi), ctx);
 		expect(ciCalls).toBe(2);
+	});
+});
+
+// ── Stacked pull requests ────────────────────────────────────────────────
+
+/**
+ * A GitHub double with state: issues, pull requests, stacks, asynchronous
+ * merges (merging PR N in a stack lands every unmerged PR below it), plus
+ * the agent worker's /run and /ci. Everything the stack code touches.
+ */
+function fakeGitHub(init: { issues?: Record<number, ReturnType<typeof issue>>; pulls?: Record<number, ReturnType<typeof spull>>; subIssues?: Record<number, number[]> } = {}) {
+	const state = {
+		issues: { ...(init.issues ?? {}) } as Record<number, ReturnType<typeof issue>>,
+		pulls: { ...(init.pulls ?? {}) } as Record<number, ReturnType<typeof spull>>,
+		subIssues: init.subIssues ?? {},
+		stacks: [] as Array<{ number: number; open: boolean; base: { ref: string }; pull_requests: Array<{ number: number; state: string; draft: boolean; merged_at: string | null; head: { ref: string; sha: string } }> }>,
+		merges: [] as Array<{ pr: number; body: Record<string, unknown> }>,
+		asyncMerge: false,
+		runs: [] as Array<Record<string, unknown>>,
+		ci: [] as Array<Record<string, unknown>>,
+		closed: [] as number[],
+		retargeted: [] as Array<{ pr: number; base: string }>,
+	};
+	const layer = (n: number) => ({ number: n, state: "open", draft: false, merged_at: null, head: state.pulls[n].head });
+	const markMerged = (pr: number) => {
+		const st = state.stacks.find((x) => x.pull_requests.some((p) => p.number === pr));
+		const prs = st ? st.pull_requests.slice(0, st.pull_requests.findIndex((p) => p.number === pr) + 1).map((p) => p.number) : [pr];
+		for (const n of prs) {
+			state.pulls[n] = { ...state.pulls[n], state: "closed", merged: true, merged_at: "2026-01-02T00:00:00Z" };
+			const entry = st?.pull_requests.find((p) => p.number === n);
+			if (entry) Object.assign(entry, { state: "closed", merged_at: "2026-01-02T00:00:00Z" });
+		}
+	};
+	const fetch = async (url: string, init?: RequestInit) => {
+		const path = new URL(url).pathname;
+		const method = init?.method ?? "GET";
+		const body = init?.body ? (JSON.parse(String(init.body)) as Record<string, unknown>) : {};
+		let m: RegExpMatchArray | null;
+		if ((m = path.match(/\/issues\/(\d+)\/sub_issues$/))) return Response.json((state.subIssues[+m[1]] ?? []).map((n) => state.issues[n]));
+		if ((m = path.match(/\/issues\/(\d+)$/)) && method === "GET") return state.issues[+m[1]] ? Response.json(state.issues[+m[1]]) : Response.json({}, { status: 404 });
+		if ((m = path.match(/\/issues\/(\d+)$/)) && method === "PATCH") {
+			state.closed.push(+m[1]);
+			return Response.json({});
+		}
+		if (path.endsWith("/issues") && method === "POST") {
+			const n = Math.max(0, ...Object.keys(state.issues).map(Number)) + 1;
+			state.issues[n] = { ...issue(n, "alice", String(body.body ?? "")), title: String(body.title ?? "") };
+			return Response.json(state.issues[n], { status: 201 });
+		}
+		if ((m = path.match(/\/pulls\/(\d+)$/)) && method === "GET") return state.pulls[+m[1]] ? Response.json(state.pulls[+m[1]]) : Response.json({}, { status: 404 });
+		if ((m = path.match(/\/pulls\/(\d+)$/)) && method === "PATCH") {
+			state.retargeted.push({ pr: +m[1], base: String(body.base) });
+			state.pulls[+m[1]].base.ref = String(body.base);
+			return Response.json(state.pulls[+m[1]]);
+		}
+		if (path.endsWith("/stacks") && method === "POST") {
+			const st = { number: 50 + state.stacks.length, open: true, base: { ref: "main" }, pull_requests: (body.pull_requests as number[]).map(layer) };
+			state.stacks.push(st);
+			return Response.json(st, { status: 201 });
+		}
+		if ((m = path.match(/\/stacks\/(\d+)\/add$/))) {
+			const st = state.stacks.find((x) => x.number === +m![1])!;
+			st.pull_requests.push(...(body.pull_requests as number[]).map(layer));
+			return Response.json(st);
+		}
+		if ((m = path.match(/\/pulls\/(\d+)\/merge-async$/)) && method === "PUT") {
+			state.merges.push({ pr: +m[1], body });
+			if (state.asyncMerge) return Response.json({ status: "pending", uuid: `u${m[1]}` }, { status: 202 });
+			markMerged(+m[1]);
+			return Response.json({ status: "merged", details: { sha: "mmmmmmm" } });
+		}
+		if ((m = path.match(/\/pulls\/(\d+)\/merge-async\/(.+)$/))) {
+			markMerged(+m[1]);
+			return Response.json({ status: "merged", details: { sha: "mmmmmmm" } });
+		}
+		if (path.endsWith("/run")) {
+			state.runs.push(body);
+			return Response.json({ submissionId: `s${state.runs.length}`, accepted: true });
+		}
+		if (path.endsWith("/ci")) {
+			state.ci.push(body);
+			return Response.json({ accepted: true }, { status: 202 });
+		}
+		return Response.json({});
+	};
+	return { state, fetch, markMerged };
+}
+
+/** A pull request with a base branch and an update time (fresh = just opened). */
+function spull(n: number, headRef: string, base = "main", opts: { sha?: string; fresh?: boolean } = {}) {
+	return {
+		...pull(n, "alice", headRef, opts.sha ?? "abc1234"),
+		base: { ref: base },
+		merged: false,
+		merged_at: null as string | null,
+		updated_at: opts.fresh ? new Date().toISOString() : "2026-01-01T00:00:00Z",
+	};
+}
+
+async function callback(ctx: unknown, issueNo: number, submissionId: string, prUrl: string | null, answer = prUrl ?? "NO_PR: unclear") {
+	return route("agent-callback")(await signed({ issue: issueNo, attempt: 1, submissionId, status: "completed", answer, prUrl }, canonicalCallback), ctx);
+}
+
+describe("stack helpers", () => {
+	it("parses command arguments", () => {
+		expect(stackOnArg("on #12")).toBe(12);
+		expect(stackOnArg("on 7, please")).toBe(7);
+		expect(stackOnArg("")).toBeNull();
+		expect(stackOnArg("later")).toBeNull();
+		expect(issueRefs("#12 #13, 14 and #12 again")).toEqual([12, 13, 14]);
+		expect(issueRefs("see PR-12 or v1.2 but #5")).toEqual([5]);
+		expect(prNumberFrom("https://github.com/acme/site/pull/42")).toBe(42);
+		expect(prNumberFrom("https://github.com/acme/site/issues/42")).toBeNull();
+	});
+
+	it("merges the longest green run from the bottom, never under a layer in flight", () => {
+		const now = Date.parse("2026-01-01T12:00:00Z");
+		const L = (pr: number, build: string | null, opts: { sha?: string; state?: "open" | "merged" | "closed"; fresh?: boolean } = {}) => ({
+			issue: pr, pr, state: opts.state ?? ("open" as const), headSha: "h", headRef: `b${pr}`,
+			updatedAt: opts.fresh ? new Date(now - 1000).toISOString() : "2026-01-01T00:00:00Z",
+			build: build ? { status: build, headSha: opts.sha ?? "h", updatedAt: new Date(now - 60_000).toISOString() } : null,
+		});
+		const o = { plannedPending: false, now, staleMs: 30 * 60_000, freshMs: 10 * 60_000 };
+		expect(decideMerge([L(1, "passed"), L(2, "passed")], o)).toMatchObject({ kind: "merge", prs: [1, 2] });
+		expect(decideMerge([L(1, "passed"), L(2, "running")], o)).toMatchObject({ kind: "hold" });
+		expect(decideMerge([L(1, "passed"), L(2, null, { fresh: true })], o)).toMatchObject({ kind: "hold" });
+		expect(decideMerge([L(1, "passed"), L(2, "failed")], o)).toMatchObject({ kind: "merge", prs: [1] });
+		expect(decideMerge([L(1, "passed"), L(2, "failed"), L(3, "passed")], o)).toMatchObject({ kind: "merge", prs: [1] });
+		expect(decideMerge([L(1, "passed", { sha: "old" })], o)).toMatchObject({ kind: "nothing" });
+		expect(decideMerge([L(1, "passed")], { ...o, plannedPending: true })).toMatchObject({ kind: "hold" });
+		expect(decideMerge([L(1, "merged", { state: "merged" }), L(2, "passed")], o)).toMatchObject({ kind: "merge", prs: [2] });
+		expect(decideMerge([L(1, "passed", { state: "closed" }), L(2, "passed")], o)).toMatchObject({ kind: "hold" });
+	});
+});
+
+describe("/agent-stack", () => {
+	it("runs the layers in order, each from the branch below, links them as a GitHub stack, and merges bottom-up once every layer is green", async () => {
+		const gh = fakeGitHub({ issues: { 1: issue(1, "alice"), 2: issue(2, "alice") } });
+		const { ctx, store, builds, stacks, calls, crons } = ctxWith({ github: conn, settings, fetch: gh.fetch });
+
+		const r = (await route("webhook")(commentEvent(1, "alice", "/agent-stack #1 #2"), ctx)) as { handled: Record<string, { started: boolean; issues: number[] }> };
+		expect(r.handled["agent-stack"]).toMatchObject({ started: true, issues: [1, 2] });
+		expect(gh.state.runs).toHaveLength(1);
+		expect(gh.state.runs[0]).toMatchObject({ issue: 1, stack: { layer: 1, size: 2 } });
+		expect(gh.state.runs[0].base).toBeUndefined();
+		expect(store.get("1")).toMatchObject({ status: "queued", layer: 1 });
+		expect(store.get("2")).toMatchObject({ status: "waiting", layer: 2 });
+		expect(commentsPosted(calls, 2)[0]).toMatch(/layer 2 of 2/);
+		expect(crons).toContain("stacks");
+		const stack = [...stacks.values()][0] as { id: string; issues: number[] };
+		expect(stack.issues).toEqual([1, 2]);
+
+		// Layer 1 opens PR 10: layer 2 starts from its branch, against it.
+		gh.state.pulls[10] = spull(10, "agent/issue-1-x");
+		await callback(ctx, 1, "s1", "https://github.com/acme/site/pull/10");
+		expect(gh.state.runs).toHaveLength(2);
+		expect(gh.state.runs[1]).toMatchObject({ issue: 2, base: "agent/issue-1-x", stack: { layer: 2, size: 2, below: { issue: 1, pr: 10, branch: "agent/issue-1-x" } } });
+		expect(store.get("2")).toMatchObject({ status: "queued", base: "agent/issue-1-x" });
+
+		// Layer 2 opens PR 11 on top: the pair becomes a GitHub stack.
+		gh.state.pulls[11] = spull(11, "agent/issue-2-y", "agent/issue-1-x", { fresh: true });
+		await callback(ctx, 2, "s2", "https://github.com/acme/site/pull/11");
+		expect(gh.state.stacks).toHaveLength(1);
+		expect(gh.state.stacks[0].pull_requests.map((p) => p.number)).toEqual([10, 11]);
+		expect(stacks.get(stack.id)).toMatchObject({ github: 50, prs: { "1": 10, "2": 11 } });
+		expect(commentsPosted(calls, 11)[0]).toMatch(/Stacked on #10/);
+
+		// PR 10 goes green while PR 11 has just opened and not built yet: hold, no merge.
+		await route("webhook")(commentEvent(10, "alice", "/awaiting-test", true), ctx);
+		await route("ci-callback")(await signed({ ...ciResult(10, 1, true), branch: "agent/issue-1-x" }, canonicalCi), ctx);
+		expect(builds.get("10")).toMatchObject({ status: "passed", stack: stack.id, baseRef: "main" });
+		expect(gh.state.merges).toEqual([]);
+		expect(stacks.get(stack.id)).toMatchObject({ summary: "waiting for #11 to start building" });
+
+		// PR 11 goes green too: one atomic stack merge of both, /merged on each, issues closed.
+		await route("webhook")(commentEvent(11, "alice", "/awaiting-test", true), ctx);
+		await route("ci-callback")(await signed({ ...ciResult(11, 1, true), branch: "agent/issue-2-y" }, canonicalCi), ctx);
+		expect(gh.state.merges).toEqual([{ pr: 11, body: { merge_method: "squash", merge_action: "default", sha: "abc1234" } }]);
+		expect(builds.get("10")).toMatchObject({ status: "merged" });
+		expect(builds.get("11")).toMatchObject({ status: "merged" });
+		expect(commentsPosted(calls, 10).map((b) => b.split("\n")[0])).toContain("/merged");
+		expect(commentsPosted(calls, 11).map((b) => b.split("\n")[0])).toContain("/merged");
+		expect(gh.state.closed.sort()).toEqual([1, 2]);
+		expect(stacks.get(stack.id)).toMatchObject({ status: "merged" });
+	});
+
+	it("without numbers, stacks the issue's open sub-issues in their order", async () => {
+		const gh = fakeGitHub({ issues: { 7: issue(7, "alice"), 8: issue(8, "alice"), 9: issue(9, "alice") }, subIssues: { 7: [9, 8] } });
+		const { ctx, store } = ctxWith({ github: conn, settings, fetch: gh.fetch });
+		const r = (await route("webhook")(commentEvent(7, "alice", "/agent-stack"), ctx)) as { handled: Record<string, { started: boolean; issues: number[] }> };
+		expect(r.handled["agent-stack"]).toMatchObject({ started: true, issues: [9, 8] });
+		expect(gh.state.runs[0]).toMatchObject({ issue: 9 });
+		expect(store.get("8")).toMatchObject({ status: "waiting", layer: 2 });
+		expect(store.get("7")).toBeUndefined();
+	});
+
+	it("a partial merge lands the green bottom, then rebuilds the layers GitHub rebases — except one the agent is still fixing", async () => {
+		const gh = fakeGitHub({
+			issues: { 3: issue(3, "alice"), 4: issue(4, "alice"), 5: issue(5, "alice") },
+			pulls: { 20: spull(20, "b3", "main", { sha: "s20" }), 21: spull(21, "b4", "b3", { sha: "s21" }), 22: spull(22, "b5", "b4", { sha: "s22" }) },
+		});
+		gh.state.stacks.push({ number: 60, open: true, base: { ref: "main" }, pull_requests: [20, 21, 22].map((n) => ({ number: n, state: "open", draft: false, merged_at: null, head: gh.state.pulls[n].head })) });
+		const { ctx, store, builds, stacks } = ctxWith({ github: conn, settings, fetch: gh.fetch });
+		stacks.set("s3-t", { id: "s3-t", issues: [3, 4, 5], prs: { "3": 20, "4": 21, "5": 22 }, github: 60, status: "running", createdBy: "alice", createdAt: "2026-01-01T00:00:00Z", updatedAt: "2026-01-01T00:00:00Z" });
+		for (const [n, pr] of [[3, 20], [4, 21], [5, 22]] as const) {
+			store.set(String(n), { number: n, title: `Issue ${n}`, author: "alice", status: "completed", prUrl: `https://github.com/acme/site/pull/${pr}`, attempt: 1, stack: "s3-t", layer: n - 2, updatedAt: "2026-01-01T00:00:00Z" });
+		}
+		const build = (pr: number, status: string, sha: string) => ({ pr, title: `PR ${pr}`, author: "alice", headRef: gh.state.pulls[pr].head.ref, headSha: sha, staticBranch: `static/${gh.state.pulls[pr].head.ref}`, attempt: 1, status, issue: pr - 17, stack: "s3-t", updatedAt: "2026-01-01T00:00:00Z" });
+		builds.set("20", build(20, "running", "s20"));
+		builds.set("21", build(21, "failed", "s21"));
+		builds.set("22", build(22, "passed", "s22"));
+
+		// The bottom layer finishes green: it merges alone (the layer above failed and is being fixed).
+		await route("ci-callback")(await signed({ ...ciResult(20, 1, true), branch: "b3", headSha: "s20" }, canonicalCi), ctx);
+		expect(gh.state.merges).toEqual([{ pr: 20, body: { merge_method: "squash", merge_action: "default", sha: "s20" } }]);
+		expect(builds.get("20")).toMatchObject({ status: "merged" });
+		expect(gh.state.closed).toEqual([3]);
+		expect(stacks.get("s3-t")).toMatchObject({ status: "running", pendingRebuild: { "21": { sha: "s21" }, "22": { sha: "s22" } } });
+
+		// GitHub rebases both upper branches: the green one is rebuilt, the failed one waits for the agent.
+		gh.state.pulls[22] = { ...gh.state.pulls[22], head: { ref: "b5", sha: "s22b" } };
+		await route("webhook")({ input: { action: "synchronize", pull_request: gh.state.pulls[22], repository: { full_name: "acme/site" } } }, ctx);
+		expect(gh.state.ci.map((c) => c.pr)).toEqual([22]);
+		expect(gh.state.ci[0]).toMatchObject({ headSha: "s22b", attempt: 2 });
+		gh.state.pulls[21] = { ...gh.state.pulls[21], head: { ref: "b4", sha: "s21b" } };
+		await route("webhook")({ input: { action: "synchronize", pull_request: gh.state.pulls[21], repository: { full_name: "acme/site" } } }, ctx);
+		expect(gh.state.ci.map((c) => c.pr)).toEqual([22]);
+		expect((stacks.get("s3-t") as { pendingRebuild?: unknown }).pendingRebuild).toBeUndefined();
+	});
+
+	it("a merge left running on GitHub is finished on the next event", async () => {
+		const gh = fakeGitHub({ issues: { 1: issue(1, "alice") }, pulls: { 10: spull(10, "b1") } });
+		gh.state.asyncMerge = true;
+		const { ctx, store, builds, stacks } = ctxWith({ github: conn, settings, fetch: gh.fetch });
+		stacks.set("s1-t", { id: "s1-t", issues: [1], prs: { "1": 10 }, status: "stopped", createdBy: "alice", createdAt: "2026-01-01T00:00:00Z", updatedAt: "2026-01-01T00:00:00Z" });
+		store.set("1", { number: 1, title: "Issue 1", author: "alice", status: "completed", prUrl: "https://github.com/acme/site/pull/10", attempt: 1, stack: "s1-t", layer: 1, updatedAt: "2026-01-01T00:00:00Z" });
+		builds.set("10", { pr: 10, title: "PR 10", author: "alice", headRef: "b1", headSha: "abc1234", staticBranch: "static/b1", attempt: 1, status: "running", issue: 1, stack: "s1-t", updatedAt: "2026-01-01T00:00:00Z" });
+		await route("ci-callback")(await signed({ ...ciResult(10, 1, true), branch: "b1" }, canonicalCi), ctx);
+		// pending → polled once → merged.
+		expect(gh.state.merges).toHaveLength(1);
+		expect(builds.get("10")).toMatchObject({ status: "merged" });
+		expect(stacks.get("s1-t")).toMatchObject({ status: "merged" });
+	}, 15_000);
+
+	it("/agent-issue on #N adds a layer on top of an issue's open pull request", async () => {
+		const gh = fakeGitHub({ issues: { 5: issue(5, "alice"), 6: issue(6, "alice") }, pulls: { 30: spull(30, "agent/issue-5-a") } });
+		const { ctx, store, stacks } = ctxWith({ github: conn, settings, fetch: gh.fetch });
+		store.set("5", { number: 5, title: "Issue 5", author: "alice", status: "completed", prUrl: "https://github.com/acme/site/pull/30", attempt: 1, updatedAt: "2026-01-01T00:00:00Z" });
+		const r = (await route("webhook")(commentEvent(6, "alice", "/agent-issue on #5"), ctx)) as { handled: Record<string, { started: boolean; layer: number }> };
+		expect(r.handled["agent-issue"]).toMatchObject({ started: true, layer: 2 });
+		expect(gh.state.runs[0]).toMatchObject({ issue: 6, base: "agent/issue-5-a", stack: { layer: 2, size: 2, below: { issue: 5, pr: 30 } } });
+		const stack = [...stacks.values()][0] as { issues: number[]; prs: Record<string, number> };
+		expect(stack).toMatchObject({ issues: [5, 6], prs: { "5": 30 } });
+		expect(store.get("5")).toMatchObject({ stack: expect.any(String), layer: 1 });
+	});
+
+	it("a layer that yields no pull request stops the stack", async () => {
+		const gh = fakeGitHub({ issues: { 1: issue(1, "alice"), 2: issue(2, "alice"), 3: issue(3, "alice") } });
+		const { ctx, store, stacks, calls } = ctxWith({ github: conn, settings, fetch: gh.fetch });
+		await route("webhook")(commentEvent(1, "alice", "/agent-stack #1 #2 #3"), ctx);
+		await callback(ctx, 1, "s1", null, "NO_PR: the issue is unclear");
+		expect(gh.state.runs).toHaveLength(1);
+		expect([...stacks.values()][0]).toMatchObject({ status: "stopped", summary: expect.stringContaining("#1 produced no pull request") });
+		expect(store.get("2")).toMatchObject({ status: "skipped" });
+		expect(store.get("3")).toMatchObject({ status: "skipped" });
+		expect(commentsPosted(calls, 2).some((b) => /stopped/.test(b) && /\/agent-stack #1 #2 #3/.test(b))).toBe(true);
+	});
+
+	it("create_stack opens the issues and starts them as one stack", async () => {
+		const gh = fakeGitHub();
+		const { ctx, store } = ctxWith({ github: conn, settings, fetch: gh.fetch });
+		const r = (await route("stacks/create")({ input: { issues: [{ title: "Data model", body: "…" }, { title: "Endpoints", body: "…" }] }, user: { id: "u", role: 30 } }, ctx)) as { success: boolean; stack: { layers: Array<{ issue: number }> }; issues: Array<{ number: number }> };
+		expect(r.success).toBe(true);
+		expect(r.issues.map((i) => i.number)).toEqual([1, 2]);
+		expect(r.stack.layers.map((l) => l.issue)).toEqual([1, 2]);
+		expect(gh.state.runs[0]).toMatchObject({ issue: 1 });
+		expect(store.get("2")).toMatchObject({ status: "waiting" });
+		expect((plugin.routes!["stacks/create"] as { permission?: string }).permission).toBe("content:edit_own");
 	});
 });

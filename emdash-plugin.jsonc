@@ -8,7 +8,7 @@
 	"security": {
 		"url": "https://github.com/MahmoodKhalil57/plugin-premium-github-agent/security/advisories/new",
 	},
-	"description": "Read and file issues on the connected GitHub repo, and let a Cloudflare-hosted coding agent open fix pull requests for issues you label — only for whitelisted GitHub users.",
+	"description": "Read and file issues on the connected GitHub repo, and let a Cloudflare-hosted coding agent turn them into pull requests — one at a time, or as stacked layers merged bottom-up — only for whitelisted GitHub users.",
 	"keywords": ["premiumcms", "github", "issues", "agent", "ai"],
 
 	// The site's own GitHub connection (Settings → General) is the only
@@ -20,6 +20,7 @@
 	"storage": {
 		"runs": { "indexes": ["status", "updatedAt", "number"] },
 		"builds": { "indexes": ["status", "updatedAt", "pr"] },
+		"stacks": { "indexes": ["status", "updatedAt"] },
 	},
 
 	"admin": {

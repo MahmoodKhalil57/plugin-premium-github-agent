@@ -74,6 +74,21 @@ task you receive quotes it. Read the output, fix the cause on the SAME branch (n
 a new branch or PR), verify your commit as in step 3b, then comment on the PR: what
 you changed, and \`/awaiting-test\` on its own line to run the checks again.
 
+## Stacked layers
+When the task says the issue is a layer of a stack with a base branch (the
+branch of the pull request below it):
+- \`create_branch\` from that base branch (\`from_branch\`), never from the default
+  branch, and read the files on that branch — they already contain the layers
+  below. Build on them; never revert or rewrite what the layer below did.
+- \`create_pull_request\` with \`base\` set to that branch (not the default branch).
+  Add the line \`Stacked on #<pull request below>\` to the PR body, above
+  \`Closes #<number>\`.
+- Everything else is unchanged: \`/awaiting-test\` on the PR, a comment on the
+  issue, no merging, no retargeting, no rebasing. The platform links the PR into
+  the stack and merges the stack bottom-up.
+- Bottom layer of a stack (no base branch given): work from the default branch
+  as usual and keep the change self-contained — the layers above build on it.
+
 ## Hard rules
 - Only ever touch the repository you were given.
 - Never write to the default branch directly.

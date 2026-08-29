@@ -2,7 +2,9 @@
  * GitHub Agent — issues on the site's connected repo, and a coding agent
  * driven entirely by slash-commands in issue and pull-request comments.
  *
- *   commands  `/agent-issue` on an issue summons the agent. `/awaiting-test`
+ *   commands  `/agent-issue` on an issue summons the agent. `/agent-stack
+ *             #a #b …` runs issues as stacked layers (`/agent-issue on #N`
+ *             adds one on top — see "Stacked pull requests"). `/awaiting-test`
  *             on a PR runs the platform checks. The runner answers per stage
  *             with `/check-succeeded` | `/check-failed`, `/test-succeeded` |
  *             `/test-failed`, `/preview-ready <url>` | `/preview-build-failed`,
@@ -25,7 +27,8 @@
  *             as its own preview Worker, so "live", one back and two back are
  *             always there.
  *   storage   `runs` — one row per issue the agent was asked about;
- *             `builds` — one row per PR / built branch.
+ *             `builds` — one row per PR / built branch; `stacks` — one row
+ *             per stack of layers.
  *   admin     /github-agent page: issues, runs, "new issue", settings.
  */
 
@@ -48,25 +51,36 @@ import {
 	type Callback,
 	type CiResult,
 	type CiStageReport,
+	type LayerBelow,
 	type PreviousDeployment,
 	type Run,
+	type StackedRun,
 } from "./agent.js";
 import {
+	addToGitHubStack,
+	asyncMergeResult,
 	branchHead,
+	closeIssue,
 	comment,
+	createGitHubStack,
 	createIssue,
 	getConnection,
 	getIssue,
 	getPull,
 	listIssues,
+	listSubIssues,
 	mergePull,
+	mergePullAsync,
+	retargetPull,
 	servePagesFromBranch,
 	setStatus,
+	type AsyncMerge,
 	type Connection,
 	type Issue,
 	type PullRequest,
 } from "./github.js";
 import { DEFAULTS, normalizeLogin, readSettings, saveSettings, type Settings } from "./settings.js";
+import { decideMerge, describeStack, issueRefs, prNumberFrom, stackId, stackOnArg, type LayerState, type Stack } from "./stacks.js";
 
 const CALLBACK_PATH = "/_emdash/api/plugins/premium-github-agent/agent-callback";
 const CI_CALLBACK_PATH = "/_emdash/api/plugins/premium-github-agent/ci-callback";
@@ -74,6 +88,7 @@ const CI_CALLBACK_PATH = "/_emdash/api/plugins/premium-github-agent/ci-callback"
 /** The comment vocabulary. Anything else in a comment is just text. */
 const COMMANDS = [
 	"agent-issue",
+	"agent-stack",
 	"awaiting-test",
 	"check-succeeded",
 	"check-failed",
@@ -87,7 +102,8 @@ const COMMANDS = [
 ] as const;
 type Command = (typeof COMMANDS)[number];
 const FAILURE_COMMANDS: Command[] = ["check-failed", "test-failed", "preview-build-failed", "preview-test-failed"];
-const COMMAND_RE = new RegExp(`(?:^|\\s)/(${COMMANDS.join("|")})(?=\\s|$)`, "g");
+/** `/command` at a word boundary, then the rest of its line (the arguments: `on #12`, `#12 #13 …`). */
+const COMMAND_RE = new RegExp(`(?:^|\\s)/(${COMMANDS.join("|")})(?=\\s|$)([^\\S\\r\\n]*[^\\r\\n]*)?`, "g");
 
 /** Every command mentioned in a comment body, in order, deduplicated. */
 function commandsIn(body: string): Command[] {
@@ -95,6 +111,16 @@ function commandsIn(body: string): Command[] {
 	for (const m of body.matchAll(COMMAND_RE)) {
 		const c = m[1] as Command;
 		if (!out.includes(c)) out.push(c);
+	}
+	return out;
+}
+
+/** The text after each command on its line (first mention wins). */
+function commandArgs(body: string): Partial<Record<Command, string>> {
+	const out: Partial<Record<Command, string>> = {};
+	for (const m of body.matchAll(COMMAND_RE)) {
+		const c = m[1] as Command;
+		if (out[c] === undefined) out[c] = (m[2] ?? "").trim();
 	}
 	return out;
 }
@@ -177,31 +203,44 @@ async function runIssue(
 	issue: Issue,
 	again = false,
 	note?: string,
+	/** Stack placement; a retry without one keeps the placement of the run it retries. */
+	placement?: { stack: { id: string; layer: number; size: number }; base?: string; below?: LayerBelow },
 ): Promise<Run> {
 	const existing = await getRun(ctx, issue.number);
 	if (existing && (existing.status === "queued" || existing.status === "running")) return existing;
 	if (existing?.status === "completed" && !again) return existing;
-	const attempt = existing ? (again ? (existing.attempt ?? 1) + 1 : (existing.attempt ?? 1)) : 1;
+	// A `waiting` row is a stack placeholder: its attempt counter carries on from the previous run of the issue.
+	const attempt = !existing ? 1 : existing.status === "waiting" || again ? (existing.attempt ?? (existing.status === "waiting" ? 0 : 1)) + 1 : (existing.attempt ?? 1);
+	let stacked: StackedRun | undefined;
+	let stackFields: Pick<Run, "stack" | "layer" | "base" | "below"> = {};
+	if (placement) {
+		stacked = { layer: placement.stack.layer, size: placement.stack.size, base: placement.base, below: placement.below };
+		stackFields = { stack: placement.stack.id, layer: placement.stack.layer, base: placement.base, below: placement.below };
+	} else if (existing?.stack) {
+		const stack = await getStack(ctx, existing.stack);
+		stacked = { layer: existing.layer ?? 1, size: stack?.issues.length ?? existing.layer ?? 1, base: existing.base, below: existing.below };
+		stackFields = { stack: existing.stack, layer: existing.layer, base: existing.base, below: existing.below };
+	}
 
-	const base = { number: issue.number, title: issue.title, author: issue.author, attempt, updatedAt: now() };
+	const seed = { number: issue.number, title: issue.title, author: issue.author, attempt, ...stackFields, updatedAt: now() };
 	if (!allowed(settings, issue.author)) {
-		const run: Run = { ...base, status: "skipped", reason: `@${issue.author} is not a whitelisted user` };
+		const run: Run = { ...seed, status: "skipped", reason: `@${issue.author} is not a whitelisted user` };
 		await putRun(ctx, run);
 		return run;
 	}
 	if (!settings.agentKey) {
-		const run: Run = { ...base, status: "error", reason: "Agent key is not set in the plugin settings" };
+		const run: Run = { ...seed, status: "error", reason: "Agent key is not set in the plugin settings" };
 		await putRun(ctx, run);
 		return run;
 	}
 	try {
-		const d = await dispatch(ctx, settings, conn, issue.number, attempt, callbackUrl(ctx), note);
-		const run: Run = { ...base, status: "queued", submissionId: d.submissionId };
+		const d = await dispatch(ctx, settings, conn, issue.number, attempt, callbackUrl(ctx), note, stacked);
+		const run: Run = { ...seed, status: "queued", submissionId: d.submissionId };
 		await putRun(ctx, run);
-		ctx.log.info(`issue #${issue.number} handed to the agent`, { submission: d.submissionId, attempt });
+		ctx.log.info(`issue #${issue.number} handed to the agent`, { submission: d.submissionId, attempt, ...(stacked ? { layer: stacked.layer, base: stacked.base } : {}) });
 		return run;
 	} catch (error) {
-		const run: Run = { ...base, status: "error", reason: String(error) };
+		const run: Run = { ...seed, status: "error", reason: String(error) };
 		await putRun(ctx, run);
 		ctx.log.error(`issue #${issue.number}: dispatch failed`, error);
 		return run;
@@ -215,6 +254,9 @@ async function refreshRun(ctx: PluginContext, settings: Settings, conn: Connecti
 		const s = await agentStatus(ctx, settings, conn, run.number, run.submissionId);
 		const next = applyOutcome(run, s.status, s.answer);
 		if (next !== run) await putRun(ctx, next);
+		if (next !== run && next.stack && next.status !== "queued" && next.status !== "running") {
+			await onRunFinished(ctx, settings, conn, next).catch((e) => ctx.log.error(`stack: run #${next.number} follow-up failed`, e));
+		}
 		return next;
 	} catch (error) {
 		ctx.log.warn(`issue #${run.number}: status check failed`, error);
@@ -296,6 +338,10 @@ interface Build {
 	summary?: string;
 	/** Issue the PR fixes when the branch is the agent's (`agent/issue-N-…`). */
 	issue?: number;
+	/** The PR's base branch (a stacked layer targets the branch below it, not the default branch). */
+	baseRef?: string;
+	/** The stack this PR is a layer of. */
+	stack?: string;
 	/** Branch builds: another build was requested while this one ran. */
 	rebuild?: boolean;
 	/** Branch builds: the deployments before the live one (`-b-1`, `-b-2`) and their preview Workers. */
@@ -406,6 +452,7 @@ async function buildPull(
 		return { started: false, reason: `reached ${settings.maxBuildAttempts} build attempts`, build: capped };
 	}
 	const issue = Number(pr.headRef.match(AGENT_BRANCH)?.[1]) || existing?.issue;
+	const run = Number.isInteger(issue) ? await getRun(ctx, issue as number) : null;
 	const build: Build = {
 		pr: pr.number,
 		title: pr.title,
@@ -417,6 +464,8 @@ async function buildPull(
 		attempt,
 		status: "running",
 		issue: Number.isInteger(issue) ? issue : undefined,
+		baseRef: pr.baseRef || existing?.baseRef,
+		stack: run?.stack ?? existing?.stack,
 		updatedAt: now(),
 	};
 	await putBuild(ctx, build);
@@ -496,6 +545,16 @@ async function recordCi(ctx: PluginContext, settings: Settings, conn: Connection
 	}
 
 	if (r.ok && settings.autoMerge) {
+		// A layer of a stack: the stack decides (bottom-up, atomic), not this PR alone.
+		const stack = (next.stack ? await getStack(ctx, next.stack) : null) ?? (await stackWithPull(ctx, r.pr));
+		if (stack && stack.status !== "merged") {
+			await settleStack(ctx, settings, conn, stack);
+			return (await getBuild(ctx, r.pr)) ?? next;
+		}
+		if (next.baseRef && next.baseRef !== conn.branch) {
+			await comment(ctx, conn, r.pr, `Not merged automatically: this pull request targets \`${next.baseRef}\`, not \`${conn.branch}\`. Link it as a stack (\`gh stack link\`) or retarget it.`).catch(() => undefined);
+			return next;
+		}
 		const m: { merged: boolean; sha?: string; message: string } = await mergePull(ctx, conn, r.pr, build.title).catch(
 			(e) => ({ merged: false, message: String(e) }),
 		);
@@ -629,7 +688,7 @@ async function recordBranchCi(ctx: PluginContext, settings: Settings, conn: Conn
 /** A command-bearing event: a freshly opened issue whose body has one, or a new comment. */
 function commandEvent(
 	input: Record<string, unknown>,
-): { number: number; isPull: boolean; author: string; body: string; commands: Command[] } | null {
+): { number: number; isPull: boolean; author: string; body: string; commands: Command[]; args: Partial<Record<Command, string>> } | null {
 	const issue = isRecord(input.issue) ? input.issue : null;
 	if (!issue) return null;
 	const number = Number(issue.number);
@@ -642,14 +701,14 @@ function commandEvent(
 		const commands = commandsIn(body);
 		if (!commands.length) return null;
 		const user = isRecord(commentObj.user) ? commentObj.user : {};
-		return { number, isPull, author: String(user.login ?? ""), body, commands };
+		return { number, isPull, author: String(user.login ?? ""), body, commands, args: commandArgs(body) };
 	}
 	if (input.action !== "opened" || isPull) return null;
 	const body = String(issue.body ?? "");
-	const commands = commandsIn(body).filter((c) => c === "agent-issue");
+	const commands = commandsIn(body).filter((c) => c === "agent-issue" || c === "agent-stack");
 	if (!commands.length) return null;
 	const user = isRecord(issue.user) ? issue.user : {};
-	return { number, isPull, author: String(user.login ?? ""), body, commands };
+	return { number, isPull, author: String(user.login ?? ""), body, commands, args: commandArgs(body) };
 }
 
 function pushFromEvent(input: unknown): { branch: string; after: string; deleted: boolean } | null {
@@ -657,14 +716,580 @@ function pushFromEvent(input: unknown): { branch: string; after: string; deleted
 	return { branch: input.ref.slice("refs/heads/".length), after: String(input.after ?? ""), deleted: input.deleted === true };
 }
 
-function pullFromEvent(input: unknown): { action: string; number: number; headSha: string; author: string } | null {
+function pullFromEvent(
+	input: unknown,
+): { action: string; number: number; headSha: string; author: string; baseRef: string; merged: boolean; stackNumber: number | null } | null {
 	if (!isRecord(input) || !isRecord(input.pull_request)) return null;
 	const pr = input.pull_request;
 	const number = Number(pr.number);
 	if (!Number.isInteger(number) || number <= 0) return null;
 	const head = isRecord(pr.head) ? pr.head : {};
+	const base = isRecord(pr.base) ? pr.base : {};
 	const user = isRecord(pr.user) ? pr.user : {};
-	return { action: String(input.action ?? ""), number, headSha: String(head.sha ?? ""), author: String(user.login ?? "") };
+	const stack = isRecord(pr.stack) ? pr.stack : isRecord(input.stack) ? input.stack : null;
+	return {
+		action: String(input.action ?? ""),
+		number,
+		headSha: String(head.sha ?? ""),
+		author: String(user.login ?? ""),
+		baseRef: String(base.ref ?? ""),
+		merged: pr.merged === true || typeof pr.merged_at === "string",
+		stackNumber: stack && Number.isInteger(Number(stack.number)) ? Number(stack.number) : null,
+	};
+}
+
+
+// ── Stacked pull requests ────────────────────────────────────────────────
+//
+// `/agent-stack #12 #13 #14` (or `/agent-stack` on an issue with sub-issues)
+// runs the listed issues as layers: the first from the default branch, each
+// next one from the branch of the pull request below it, as soon as that PR
+// is open. `/agent-issue on #12` appends one layer to #12's stack. The PRs are
+// linked as a GitHub stack; the platform builds every layer and merges the
+// stack bottom-up through GitHub's atomic stack merge (the longest green run
+// from the bottom, never under a layer still building), then rebuilds the
+// layers GitHub rebases. Records live in the `stacks` storage; a cron tick
+// keeps them moving when a webhook or callback is lost.
+
+const STACK_TICK = "stacks";
+const STACK_TICK_SCHEDULE = "*/2 * * * *";
+/** A PR that changed this recently and has no build yet is about to be built (the agent comments /awaiting-test right after opening it). */
+const FRESH_PR_MS = 10 * 60 * 1000;
+/** A rebased layer whose branch has not moved after this long: a conflict, most likely. */
+const REBASE_WAIT_MS = 15 * 60 * 1000;
+/** How many 2-second polls a route gives GitHub's asynchronous merge before leaving it to the tick. */
+const MERGE_POLLS = 5;
+
+function isStack(v: unknown): v is Stack {
+	return isRecord(v) && typeof v.id === "string" && Array.isArray(v.issues) && typeof v.status === "string";
+}
+
+async function getStack(ctx: PluginContext, id: string): Promise<Stack | null> {
+	const row = await ctx.storage.stacks!.get(id);
+	return isStack(row) ? row : null;
+}
+
+async function putStack(ctx: PluginContext, stack: Stack): Promise<Stack> {
+	const next = { ...stack, updatedAt: now() };
+	await ctx.storage.stacks!.put(stack.id, next);
+	return next;
+}
+
+async function listStacks(ctx: PluginContext, limit = 30): Promise<Stack[]> {
+	const r = await ctx.storage.stacks!.query({ orderBy: { updatedAt: "desc" }, limit });
+	return r.items.map((i) => i.data).filter(isStack);
+}
+
+async function stackOf(ctx: PluginContext, run: Run | null): Promise<Stack | null> {
+	return run?.stack ? getStack(ctx, run.stack) : null;
+}
+
+/** The unfinished stack one of whose layers is this pull request. */
+async function stackWithPull(ctx: PluginContext, pr: number): Promise<Stack | null> {
+	for (const s of await listStacks(ctx, 30)) {
+		if (s.status !== "merged" && Object.values(s.prs).includes(pr)) return s;
+	}
+	return null;
+}
+
+function prOf(stack: Stack, issue: number): number | undefined {
+	return stack.prs[String(issue)];
+}
+
+/** Layers without a pull request yet, bottom first. */
+function planned(stack: Stack): number[] {
+	return stack.issues.filter((n) => !prOf(stack, n));
+}
+
+function stackView(stack: Stack) {
+	return {
+		id: stack.id,
+		status: stack.status,
+		summary: stack.summary ?? null,
+		github: stack.github ?? null,
+		layers: stack.issues.map((n, i) => ({ layer: i + 1, issue: n, pr: prOf(stack, n) ?? null })),
+	};
+}
+
+async function ensureTick(ctx: PluginContext): Promise<void> {
+	try {
+		await ctx.cron?.schedule(STACK_TICK, { schedule: STACK_TICK_SCHEDULE });
+	} catch (error) {
+		ctx.log.warn("stack tick not scheduled", error);
+	}
+}
+
+function sleep(ms: number): Promise<void> {
+	return typeof setTimeout === "function" ? new Promise((r) => setTimeout(r, ms)) : Promise.resolve();
+}
+
+function layerComment(stack: Stack, issue: number): string {
+	const layer = stack.issues.indexOf(issue) + 1;
+	const below = layer > 1 ? stack.issues[layer - 2] : null;
+	return [
+		`Stacked pull requests: layer ${layer} of ${stack.issues.length} (${describeStack(stack)}).`,
+		below
+			? `The agent starts on this issue as soon as #${below}'s pull request is open — from that branch, with a pull request against it.`
+			: "The agent starts on this issue now, from the default branch; the layers above build on its branch.",
+		"The platform links the pull requests as a GitHub stack, builds every layer, and merges the stack bottom-up once every layer is green.",
+	].join(" ");
+}
+
+/** Plan a stack of issues (bottom first) and start its first layer. */
+async function startStack(
+	ctx: PluginContext,
+	settings: Settings,
+	conn: Connection,
+	numbers: number[],
+	createdBy: string,
+): Promise<{ stack: Stack } | { error: string }> {
+	const issues = [...new Set(numbers.filter((n) => Number.isInteger(n) && n > 0))];
+	if (issues.length < 2) return { error: "a stack needs at least two issues, bottom first: `/agent-stack #12 #13`" };
+	const found = new Map<number, Issue>();
+	for (const n of issues) {
+		const issue = await getIssue(ctx, conn, n);
+		if (!issue) return { error: `#${n} was not found (or is a pull request)` };
+		if (issue.state !== "open") return { error: `#${n} is closed` };
+		const run = await getRun(ctx, n);
+		if (run && (run.status === "queued" || run.status === "running")) return { error: `the agent is already working on #${n}` };
+		const other = await stackOf(ctx, run);
+		if (other && other.status === "running" && other.issues.includes(n)) {
+			return { error: `#${n} is already layer ${other.issues.indexOf(n) + 1} of stack ${other.id} (${describeStack(other)})` };
+		}
+		found.set(n, issue);
+	}
+	let stack = await putStack(ctx, { id: stackId(issues[0]), issues, prs: {}, status: "running", createdBy, createdAt: now(), updatedAt: now() });
+	for (const [i, n] of issues.entries()) {
+		await placeholderRun(ctx, found.get(n)!, stack, i + 1);
+		await comment(ctx, conn, n, layerComment(stack, n)).catch(() => undefined);
+	}
+	await ensureTick(ctx);
+	stack = await advanceStack(ctx, settings, conn, stack);
+	return { stack };
+}
+
+/** A `waiting` run row for a layer that has not started; the attempt counter carries on from the issue's previous run. */
+async function placeholderRun(ctx: PluginContext, issue: Issue, stack: Stack, layer: number): Promise<void> {
+	const run = await getRun(ctx, issue.number);
+	await putRun(ctx, {
+		number: issue.number,
+		title: issue.title,
+		author: issue.author,
+		attempt: run?.attempt ?? 0,
+		status: "waiting",
+		stack: stack.id,
+		layer,
+		updatedAt: now(),
+	});
+}
+
+/** Start the next layer whose pull request is missing, once the layer below has one. */
+async function advanceStack(ctx: PluginContext, settings: Settings, conn: Connection, stack: Stack): Promise<Stack> {
+	if (stack.status !== "running") return stack;
+	const idx = stack.issues.findIndex((n) => !prOf(stack, n));
+	if (idx < 0) return stack;
+	const number = stack.issues[idx];
+	const run = await getRun(ctx, number);
+	// In flight, or finished without a PR (onRunFinished decides what that means).
+	if (run && run.stack === stack.id && run.status !== "waiting") return stack;
+	let base: string | undefined;
+	let below: LayerBelow | undefined;
+	if (idx > 0) {
+		const belowIssue = stack.issues[idx - 1];
+		const belowPr = prOf(stack, belowIssue)!;
+		const pull = await getPull(ctx, conn, belowPr);
+		if (!pull) return stopStack(ctx, conn, stack, `pull request #${belowPr} (layer ${idx}) was not found`);
+		if (pull.state === "open") {
+			base = pull.headRef;
+			below = { issue: belowIssue, pr: belowPr, branch: pull.headRef };
+		} else if (pull.merged) {
+			// Everything below has landed: this layer starts afresh from the default branch.
+			if (stack.github) stack = await putStack(ctx, { ...stack, github: undefined });
+		} else {
+			return stopStack(ctx, conn, stack, `pull request #${belowPr} (layer ${idx}) was closed without merging`);
+		}
+	}
+	const issue = await getIssue(ctx, conn, number);
+	if (!issue) return stopStack(ctx, conn, stack, `issue #${number} (layer ${idx + 1}) was not found`);
+	const next = await runIssue(ctx, settings, conn, issue, !!run && run.status !== "waiting", undefined, {
+		stack: { id: stack.id, layer: idx + 1, size: stack.issues.length },
+		base,
+		below,
+	});
+	if (next.status !== "queued") return stopStack(ctx, conn, stack, `#${number}: ${next.reason ?? next.status}`);
+	return stack;
+}
+
+/** No more layers start; the pull requests that exist keep their own life (and still merge when green). */
+async function stopStack(ctx: PluginContext, conn: Connection, stack: Stack, reason: string): Promise<Stack> {
+	const rest = planned(stack);
+	const next = await putStack(ctx, { ...stack, status: "stopped", summary: reason });
+	for (const n of rest) {
+		const run = await getRun(ctx, n);
+		if (run?.status === "waiting") await putRun(ctx, { ...run, status: "skipped", reason: `stack stopped: ${reason}` });
+		await comment(
+			ctx,
+			conn,
+			n,
+			`Stack ${describeStack(stack)} stopped: ${reason}. ${
+				rest.length > 1
+					? `Layers without a pull request were not started — fix the cause and comment \`/agent-stack ${rest.map((i) => `#${i}`).join(" ")}\` to run them.`
+					: "Fix the cause and comment `/agent-issue` (or `/agent-issue on #…`) to run it."
+			}`,
+		).catch(() => undefined);
+	}
+	ctx.log.warn(`stack ${stack.id} stopped: ${reason}`);
+	return next;
+}
+
+/** A run ended (callback or reconcile): record the layer's PR, link it, start the next layer, and see whether the stack can merge. */
+async function onRunFinished(ctx: PluginContext, settings: Settings, conn: Connection, run: Run): Promise<void> {
+	let stack = await stackOf(ctx, run);
+	if (!stack || stack.status !== "running") return;
+	const pr = run.status === "completed" ? prNumberFrom(run.prUrl) : null;
+	if (pr) {
+		if (prOf(stack, run.number) !== pr) {
+			stack = await putStack(ctx, { ...stack, prs: { ...stack.prs, [String(run.number)]: pr } });
+			stack = await linkLayer(ctx, conn, stack, run.number, pr);
+		}
+		stack = await advanceStack(ctx, settings, conn, stack);
+		await settleStack(ctx, settings, conn, stack);
+		return;
+	}
+	if (run.status !== "completed" && run.status !== "error" && run.status !== "skipped") return;
+	const why = run.reason ?? run.answer ?? run.status;
+	if (prOf(stack, run.number)) {
+		// A fix attempt that gave up: the PR exists, the layers below can still merge.
+		stack = await putStack(ctx, { ...stack, summary: `#${run.number}: ${why}` });
+		await settleStack(ctx, settings, conn, stack);
+		return;
+	}
+	await stopStack(ctx, conn, stack, `#${run.number} produced no pull request (${why})`);
+}
+
+/** Link a freshly opened layer on top of the one below as a GitHub stack (created with the first pair, extended after). */
+async function linkLayer(ctx: PluginContext, conn: Connection, stack: Stack, issue: number, pr: number): Promise<Stack> {
+	const idx = stack.issues.indexOf(issue);
+	if (idx <= 0) return stack;
+	const belowPr = prOf(stack, stack.issues[idx - 1]);
+	if (!belowPr) return stack;
+	try {
+		const below = await getPull(ctx, conn, belowPr);
+		if (below?.merged) {
+			// The layer below landed while this one was being written: nothing to stack on any more.
+			const mine = await getPull(ctx, conn, pr);
+			if (mine && mine.baseRef !== conn.branch) {
+				await retargetPull(ctx, conn, pr, conn.branch);
+				await comment(ctx, conn, pr, `#${belowPr} was already merged, so this pull request now targets \`${conn.branch}\` on its own.`).catch(() => undefined);
+			}
+			return putStack(ctx, { ...stack, github: undefined });
+		}
+		const gh = stack.github ? await addToGitHubStack(ctx, conn, stack.github, [pr]) : await createGitHubStack(ctx, conn, [belowPr, pr]);
+		const next = await putStack(ctx, { ...stack, github: gh.number });
+		await comment(
+			ctx,
+			conn,
+			pr,
+			`Stacked on #${belowPr} as layer ${idx + 1} of ${stack.issues.length} (GitHub stack #${gh.number}). The platform merges the stack bottom-up once every layer is green.`,
+		).catch(() => undefined);
+		return next;
+	} catch (error) {
+		ctx.log.warn(`stack ${stack.id}: linking #${pr} on #${belowPr} failed`, error);
+		await comment(
+			ctx,
+			conn,
+			pr,
+			`Could not link this pull request into the GitHub stack on top of #${belowPr}: ${String(error)}. It stays open on its branch and is not merged automatically until it is linked (\`gh stack link\`) or retargeted.`,
+		).catch(() => undefined);
+		return stack;
+	}
+}
+
+/** The layers with a pull request, bottom first, as the merge decision sees them. */
+async function stackLayers(ctx: PluginContext, conn: Connection, stack: Stack): Promise<LayerState[]> {
+	const out: LayerState[] = [];
+	for (const issue of stack.issues) {
+		const pr = prOf(stack, issue);
+		if (!pr) break;
+		const pull = await getPull(ctx, conn, pr);
+		if (!pull) continue;
+		const b = await getBuild(ctx, pr);
+		out.push({
+			issue,
+			pr,
+			state: pull.merged ? "merged" : pull.state === "open" ? "open" : "closed",
+			headSha: pull.headSha,
+			headRef: pull.headRef,
+			updatedAt: pull.updatedAt,
+			build: b ? { status: b.status, headSha: b.headSha, updatedAt: b.updatedAt } : null,
+		});
+	}
+	return out;
+}
+
+/** Is a planned layer still on its way to a pull request? */
+async function plannedPending(ctx: PluginContext, stack: Stack): Promise<boolean> {
+	if (stack.status !== "running") return false;
+	const next = planned(stack)[0];
+	if (!next) return false;
+	const run = await getRun(ctx, next);
+	return !!run && run.stack === stack.id && (run.status === "waiting" || run.status === "queued" || run.status === "running");
+}
+
+/** Merge what is green, bottom-up, when nothing above it is in flight. */
+async function settleStack(ctx: PluginContext, settings: Settings, conn: Connection, stack: Stack): Promise<Stack> {
+	if (stack.status === "merged" || !settings.autoMerge) return stack;
+	if (stack.merging) {
+		stack = await finishStackMerge(ctx, settings, conn, stack);
+		if (stack.merging || stack.status === "merged") return stack;
+	}
+	const layers = await stackLayers(ctx, conn, stack);
+	const d = decideMerge(layers, { plannedPending: await plannedPending(ctx, stack), now: Date.now(), staleMs: STALE_BUILD_MS, freshMs: FRESH_PR_MS });
+	if (d.kind === "hold") return stack.summary === d.reason ? stack : putStack(ctx, { ...stack, summary: d.reason });
+	if (d.kind === "nothing") return stack;
+	if (stack.mergeRefused && stack.mergeRefused.pr === d.top.pr && stack.mergeRefused.sha === d.top.headSha) return stack;
+	const m = await mergePullAsync(ctx, conn, d.top.pr, d.top.headSha).catch((e): AsyncMerge => ({ status: "failed", message: String(e) }));
+	return applyStackMerge(ctx, settings, conn, stack, layers, d.prs, m);
+}
+
+/** Take GitHub's asynchronous merge to its end: poll a little, then leave the rest to the tick and the `closed` webhooks. */
+async function applyStackMerge(
+	ctx: PluginContext,
+	settings: Settings,
+	conn: Connection,
+	stack: Stack,
+	layers: LayerState[],
+	prs: number[],
+	m: AsyncMerge,
+): Promise<Stack> {
+	const top = prs[prs.length - 1];
+	if (m.status === "merged") return completeStackMerge(ctx, settings, conn, stack, layers, prs, m.sha);
+	if (m.status === "failed") return refuseStackMerge(ctx, conn, stack, layers, top, m.message);
+	for (let i = 0; i < MERGE_POLLS && m.uuid && m.status === "pending"; i++) {
+		await sleep(2000);
+		const r = await asyncMergeResult(ctx, conn, top, m.uuid);
+		if (r.status === "merged") return completeStackMerge(ctx, settings, conn, stack, layers, prs, r.sha);
+		if (r.status === "failed") return refuseStackMerge(ctx, conn, stack, layers, top, r.message);
+		if (r.status === "enqueued") break;
+	}
+	return putStack(ctx, {
+		...stack,
+		merging: { pr: top, uuid: m.uuid ?? "", prs, startedAt: now() },
+		summary: `merging ${prs.map((p) => `#${p}`).join(", ")} — GitHub is working on it`,
+	});
+}
+
+/** A merge left running on GitHub: see whether it finished (by its result, or by the pull requests showing merged). */
+async function finishStackMerge(ctx: PluginContext, settings: Settings, conn: Connection, stack: Stack): Promise<Stack> {
+	const m = stack.merging!;
+	const layers = await stackLayers(ctx, conn, stack);
+	if (m.prs.every((pr) => layers.find((l) => l.pr === pr)?.state === "merged")) {
+		return completeStackMerge(ctx, settings, conn, stack, layers, m.prs, undefined);
+	}
+	if (m.uuid) {
+		const r = await asyncMergeResult(ctx, conn, m.pr, m.uuid);
+		if (r.status === "merged") return completeStackMerge(ctx, settings, conn, stack, layers, m.prs, r.sha);
+		if (r.status === "failed") return refuseStackMerge(ctx, conn, stack, layers, m.pr, r.message);
+	}
+	if (Date.now() - Date.parse(m.startedAt) > REBASE_WAIT_MS) {
+		return refuseStackMerge(ctx, conn, stack, layers, m.pr, "the merge did not finish on GitHub");
+	}
+	return stack;
+}
+
+/**
+ * Some layers landed: mark them merged (`/merged`), close their issues, and
+ * remember the open layers above with their last built head — GitHub rebases
+ * them now, and each is rebuilt once its branch moves.
+ */
+async function completeStackMerge(
+	ctx: PluginContext,
+	settings: Settings,
+	conn: Connection,
+	stack: Stack,
+	layers: LayerState[],
+	prs: number[],
+	sha: string | undefined,
+): Promise<Stack> {
+	for (const pr of prs) {
+		const b = await getBuild(ctx, pr);
+		if (b?.status === "merged") continue;
+		if (b) await putBuild(ctx, { ...b, status: "merged", summary: `merged into ${conn.branch} with the stack${sha ? ` @ ${sha.slice(0, 7)}` : ""}` });
+		await comment(
+			ctx,
+			conn,
+			pr,
+			[`/merged`, `Every check passed — merged into \`${conn.branch}\` as part of the stack (${prs.map((p) => `#${p}`).join(", ")}); \`${staticBranchFor(conn.branch)}\` rebuilds from it.`].join("\n"),
+		).catch(() => undefined);
+		const issue = stack.issues.find((n) => prOf(stack, n) === pr);
+		if (issue) await closeIssue(ctx, conn, issue).catch((e) => ctx.log.warn(`issue #${issue} not closed`, e));
+	}
+	ctx.log.info(`stack ${stack.id}: merged ${prs.map((p) => `#${p}`).join(", ")} into ${conn.branch}`, { sha });
+	const above = layers.filter((l) => l.state === "open" && !prs.includes(l.pr));
+	const pendingRebuild = { ...(stack.pendingRebuild ?? {}) };
+	for (const l of above) pendingRebuild[String(l.pr)] = { sha: l.build?.headSha ?? l.headSha, since: now() };
+	const done = above.length === 0 && planned(stack).length === 0;
+	return putStack(ctx, {
+		...stack,
+		merging: undefined,
+		mergeRefused: undefined,
+		pendingRebuild: done || !above.length ? undefined : pendingRebuild,
+		status: done ? "merged" : stack.status,
+		summary: done
+			? `all ${stack.issues.length} layers merged into ${conn.branch}`
+			: `merged ${prs.map((p) => `#${p}`).join(", ")}${above.length ? `; GitHub rebases ${above.map((l) => `#${l.pr}`).join(", ")}, then they rebuild` : ""}`,
+	});
+}
+
+async function refuseStackMerge(ctx: PluginContext, conn: Connection, stack: Stack, layers: LayerState[], pr: number, message: string): Promise<Stack> {
+	const sha = layers.find((l) => l.pr === pr)?.headSha ?? "";
+	await comment(ctx, conn, pr, `Could not merge the stack automatically: ${message}. It stays open for a human; a new commit on any layer re-arms auto-merge.`).catch(() => undefined);
+	ctx.log.warn(`stack ${stack.id}: merge of #${pr} refused: ${message}`);
+	return putStack(ctx, { ...stack, merging: undefined, mergeRefused: { pr, sha, message }, summary: `merge refused: ${message}` });
+}
+
+/** A layer GitHub rebased after the merge below it: build the new head — unless the agent is still fixing that layer. */
+async function rebuildRebased(ctx: PluginContext, settings: Settings, conn: Connection, stack: Stack, pr: number, headSha: string): Promise<Stack> {
+	const entry = stack.pendingRebuild?.[String(pr)];
+	if (!entry || entry.sha === headSha) return stack;
+	const b = await getBuild(ctx, pr);
+	if (b?.status === "running" && !isStale(b)) return stack; // let it finish; the tick comes back
+	const rest = { ...stack.pendingRebuild };
+	delete rest[String(pr)];
+	const next = await putStack(ctx, { ...stack, pendingRebuild: Object.keys(rest).length ? rest : undefined });
+	if (b && b.status !== "passed" && b.status !== "merged") return next; // failed / capped: the agent's fix asks for the build
+	const pull = await getPull(ctx, conn, pr);
+	if (pull?.state === "open") {
+		const r = await buildPull(ctx, settings, conn, pull, { force: true });
+		if (!r.started) ctx.log.warn(`PR #${pr}: rebuild after rebase not started: ${r.reason}`);
+	}
+	return next;
+}
+
+/** The cron tick: reconcile runs and builds, then keep every unfinished stack moving. */
+async function stackTick(ctx: PluginContext): Promise<void> {
+	const setup = await requireSetup(ctx);
+	if (!setup.ok) return;
+	const { conn, settings } = setup;
+	await poll(ctx);
+	for (let stack of await listStacks(ctx, 20)) {
+		if (stack.status === "merged") continue;
+		for (const [key, entry] of Object.entries(stack.pendingRebuild ?? {})) {
+			const pr = Number(key);
+			const pull = await getPull(ctx, conn, pr).catch(() => null);
+			if (!pull) continue;
+			if (pull.headSha !== entry.sha) {
+				stack = await rebuildRebased(ctx, settings, conn, stack, pr, pull.headSha);
+			} else if (Date.now() - Date.parse(entry.since) > REBASE_WAIT_MS) {
+				const rest = { ...stack.pendingRebuild };
+				delete rest[key];
+				stack = await putStack(ctx, { ...stack, pendingRebuild: Object.keys(rest).length ? rest : undefined, summary: `#${pr} was not rebased after the merge below it (a conflict?)` });
+				await comment(
+					ctx,
+					conn,
+					pr,
+					`The layer below merged, but GitHub has not rebased this branch in ${REBASE_WAIT_MS / 60000} minutes — most likely a conflict. Rebase the stack (\`gh stack sync\`, or "Rebase stack" on the pull request) and comment \`/awaiting-test\`.`,
+				).catch(() => undefined);
+			}
+		}
+		stack = await advanceStack(ctx, settings, conn, stack);
+		await settleStack(ctx, settings, conn, stack);
+	}
+}
+
+/** `/agent-stack #a #b …` — or, without numbers, the issue's open sub-issues in their order. */
+async function handleAgentStack(
+	ctx: PluginContext,
+	settings: Settings,
+	conn: Connection,
+	number: number,
+	args: string,
+	author: string,
+): Promise<Record<string, unknown>> {
+	let issues = issueRefs(args);
+	const listed = issues.length > 0;
+	if (!listed) {
+		try {
+			issues = (await listSubIssues(ctx, conn, number)).filter((i) => i.state === "open").map((i) => i.number);
+		} catch (error) {
+			return { started: false, reason: String(error) };
+		}
+	}
+	if (issues.length < 2) {
+		await comment(
+			ctx,
+			conn,
+			number,
+			listed && issues.length === 1
+				? `One issue is not a stack — comment \`/agent-issue\` on #${issues[0]} instead, or list the layers bottom first: \`/agent-stack #${issues[0]} #…\`.`
+				: "List the layers bottom first — `/agent-stack #12 #13 #14` — or add at least two open sub-issues to this issue and comment `/agent-stack` again.",
+		).catch(() => undefined);
+		return { started: false, reason: "fewer than two issues" };
+	}
+	const r = await startStack(ctx, settings, conn, issues, author);
+	if ("error" in r) {
+		await comment(ctx, conn, number, `Stack not started: ${r.error}.`).catch(() => undefined);
+		return { started: false, reason: r.error };
+	}
+	return { started: true, stack: r.stack.id, issues };
+}
+
+/** `/agent-issue on #N` — one more layer on top of #N's stack (or on #N's own pull request). */
+async function handleAgentIssueOn(
+	ctx: PluginContext,
+	settings: Settings,
+	conn: Connection,
+	number: number,
+	on: number,
+	author: string,
+): Promise<Record<string, unknown>> {
+	if (on === number) {
+		await comment(ctx, conn, number, "An issue cannot stack on itself — `/agent-issue on #N` names the issue whose pull request this one builds on.").catch(() => undefined);
+		return { started: false, reason: "self" };
+	}
+	const issue = await getIssue(ctx, conn, number);
+	if (!issue) return { started: false, reason: "issue not found" };
+	const run = await getRun(ctx, number);
+	if (run && (run.status === "queued" || run.status === "running")) return { started: false, reason: "already working on it" };
+	const mine = await stackOf(ctx, run);
+	if (mine?.status === "running" && mine.issues.includes(number)) {
+		await comment(ctx, conn, number, `Already layer ${mine.issues.indexOf(number) + 1} of stack ${describeStack(mine)}.`).catch(() => undefined);
+		return { started: false, reason: "already stacked" };
+	}
+	const belowRun = await getRun(ctx, on);
+	let stack = await stackOf(ctx, belowRun);
+	if (!stack || stack.status !== "running") {
+		const belowPr = prNumberFrom(belowRun?.prUrl);
+		const inFlight = belowRun?.status === "queued" || belowRun?.status === "running";
+		if (!belowPr && !inFlight) {
+			await comment(
+				ctx,
+				conn,
+				number,
+				belowRun
+					? `#${on}'s run ended without a pull request (${belowRun.reason ?? belowRun.answer ?? belowRun.status}) — comment \`/agent-stack #${on} #${number}\` to run both as a stack.`
+					: `#${on} has not been handed to the agent — comment \`/agent-stack #${on} #${number}\` to run both as a stack.`,
+			).catch(() => undefined);
+			return { started: false, reason: `#${on} has no pull request` };
+		}
+		// #on is an ordinary run: it becomes the bottom of a new stack.
+		stack = await putStack(ctx, {
+			id: stackId(on),
+			issues: [on],
+			prs: belowPr ? { [String(on)]: belowPr } : {},
+			status: "running",
+			createdBy: author,
+			createdAt: now(),
+			updatedAt: now(),
+		});
+		if (belowRun) await putRun(ctx, { ...belowRun, stack: stack.id, layer: 1 });
+		await ensureTick(ctx);
+	}
+	stack = await putStack(ctx, { ...stack, issues: [...stack.issues, number] });
+	await placeholderRun(ctx, issue, stack, stack.issues.length);
+	await comment(ctx, conn, number, layerComment(stack, number)).catch(() => undefined);
+	stack = await advanceStack(ctx, settings, conn, stack);
+	return { started: stack.status === "running", stack: stack.id, layer: stack.issues.length };
 }
 
 // ── Plugin ───────────────────────────────────────────────────────────────
@@ -679,7 +1304,7 @@ const plugin: SandboxedPlugin = {
 		tools: {
 			create_issue: {
 				description:
-					"Open an issue on the site's connected GitHub repository. With agent=true (the default) the coding agent picks it up: it studies the repository, opens a pull request, the platform builds, tests and previews it, and merges it when every check passes; the site rebuilds afterwards. Describe the change precisely: what, where it shows on the page, the exact current text, what it should look like or do afterwards, acceptance criteria.",
+					"Open an issue on the site's connected GitHub repository. With agent=true (the default) the coding agent picks it up: it studies the repository, opens a pull request, the platform builds, tests and previews it, and merges it when every check passes; the site rebuilds afterwards. Describe the change precisely: what, where it shows on the page, the exact current text, what it should look like or do afterwards, acceptance criteria. `on` stacks the change on top of another issue's pull request (its branch) — for a change that depends on one still in flight; for a planned series use create_stack.",
 				route: "issues/create",
 				destructive: false,
 				input: z.object({
@@ -687,6 +1312,7 @@ const plugin: SandboxedPlugin = {
 					body: z.string().min(1).describe("What to change and why, with acceptance criteria"),
 					agent: z.boolean().optional().describe("Hand the issue to the coding agent (default true)"),
 					labels: z.array(z.string()).optional(),
+					on: z.number().int().positive().optional(),
 				}),
 			},
 			list_issues: {
@@ -695,8 +1321,18 @@ const plugin: SandboxedPlugin = {
 				destructive: false,
 				input: z.object({ label: z.string().optional() }),
 			},
+			create_stack: {
+				description:
+					"Open several issues as ONE stack of layers, bottom first, and hand them to the coding agent: each layer's pull request builds on the branch of the one below, so dependent or same-area changes never conflict and never wait for each other's merge. The platform links them as a GitHub stack, builds every layer, and merges the stack bottom-up once every layer is green; the site rebuilds after the merge. Use it instead of several create_issue calls whenever the changes depend on each other or touch the same files; keep each layer small and independently reviewable.",
+				route: "stacks/create",
+				destructive: false,
+				input: z.object({
+					issues: z.array(z.object({ title: z.string().min(1), body: z.string() })).min(2).max(10),
+					labels: z.array(z.string()).optional(),
+				}),
+			},
 			issue_status: {
-				description: "Where one issue stands: the agent run (attempt, PR link or reason), the pull request's build / preview / merge state, and the site's latest default-branch build.",
+				description: "Where one issue stands: the agent run (attempt, PR link or reason), the pull request's build / preview / merge state, its stack (layers, their PRs, what the stack is waiting for) and the site's latest default-branch build.",
 				route: "issues/status",
 				destructive: false,
 				input: z.object({ number: z.number().int().positive() }),
@@ -710,7 +1346,14 @@ const plugin: SandboxedPlugin = {
 				if (k === "agentKey" || k === "allowedUsers") continue;
 				if ((await ctx.kv.get(`settings:${k}`)) === null) await ctx.kv.set(`settings:${k}`, v);
 			}
+			await ensureTick(ctx);
 			ctx.log.info("GitHub agent installed");
+		},
+
+		/** Every two minutes: reconcile runs and builds, keep stacks moving (lost webhooks, merges left running on GitHub, rebased layers). */
+		cron: async (event, ctx) => {
+			if (event.name !== STACK_TICK) return;
+			await stackTick(ctx).catch((e) => ctx.log.error("stack tick failed", e));
 		},
 
 		// Publishing content changes the static site: rebuild the default
@@ -746,25 +1389,51 @@ const plugin: SandboxedPlugin = {
 					return { success: true, branch: push.branch, started: r.started, reason: r.reason };
 				}
 
-				// Closed PRs: drop the preview. Nothing else about PRs is implicit.
+				// Pull requests: a layer GitHub rebased after a merge below it is
+				// rebuilt; a layer linked by hand records its stack; closed PRs drop
+				// their preview. Nothing else about PRs is implicit.
 				const pull = pullFromEvent(input);
 				if (pull) {
+					if (pull.action === "synchronize") {
+						const stack = await stackWithPull(ctx, pull.number);
+						if (!stack?.pendingRebuild?.[String(pull.number)]) return { success: true, ignored: "pull_request synchronize" };
+						const setup = await requireSetup(ctx);
+						if (!setup.ok) return { success: false, error: setup.error };
+						await rebuildRebased(ctx, setup.settings, setup.conn, stack, pull.number, pull.headSha);
+						return { success: true, pr: pull.number, rebased: true };
+					}
+					if (pull.action === "stacked") {
+						const stack = pull.stackNumber ? await stackWithPull(ctx, pull.number) : null;
+						if (stack && stack.github !== pull.stackNumber) await putStack(ctx, { ...stack, github: pull.stackNumber! });
+						return { success: true, pr: pull.number, stack: pull.stackNumber };
+					}
 					if (pull.action !== "closed") return { success: true, ignored: `pull_request ${pull.action}` };
 					const setup = await requireSetup(ctx);
 					if (!setup.ok) return { success: false, error: setup.error };
 					const build = await getBuild(ctx, pull.number);
+					const merged = build?.status === "merged" || pull.merged;
 					if (build) {
 						const deleted = build.previewUrl
 							? await deletePreview(ctx, setup.settings, setup.conn, pull.number).catch(() => false)
 							: false;
 						await putBuild(ctx, {
 							...build,
-							status: build.status === "merged" ? "merged" : "closed",
+							status: merged ? "merged" : "closed",
 							previewUrl: undefined,
-							summary: `${build.status === "merged" ? build.summary : "closed"}; preview ${deleted ? "removed" : "not removed"}`,
+							summary: `${build.status === "merged" ? build.summary : merged ? `merged into ${setup.conn.branch}` : "closed"}; preview ${deleted ? "removed" : "not removed"}`,
 						});
 					}
-					return { success: true, pr: pull.number, closed: true };
+					// A layer of a stack landed (our merge, or someone's) or was closed: let the stack catch up.
+					const stack = await stackWithPull(ctx, pull.number);
+					if (stack) {
+						if (pull.merged && build?.status !== "merged") {
+							const layers = await stackLayers(ctx, setup.conn, stack);
+							await completeStackMerge(ctx, setup.settings, setup.conn, stack, layers, [pull.number], undefined);
+						} else {
+							await settleStack(ctx, setup.settings, setup.conn, stack);
+						}
+					}
+					return { success: true, pr: pull.number, closed: true, merged };
 				}
 
 				// Commands: a new issue whose body carries one, or a new comment.
@@ -778,10 +1447,17 @@ const plugin: SandboxedPlugin = {
 
 				for (const command of cmd.commands) {
 					if (command === "agent-issue" && !cmd.isPull) {
+						const on = stackOnArg(cmd.args["agent-issue"] ?? "");
+						if (on) {
+							handled[command] = await handleAgentIssueOn(ctx, setup.settings, setup.conn, cmd.number, on, cmd.author);
+							continue;
+						}
 						const issue = await getIssue(ctx, setup.conn, cmd.number);
 						if (!issue) return { success: true, ignored: "issue not found" };
 						const run = await runIssue(ctx, setup.settings, setup.conn, issue, true);
 						handled[command] = { status: run.status, attempt: run.attempt, reason: run.reason };
+					} else if (command === "agent-stack" && !cmd.isPull) {
+						handled[command] = await handleAgentStack(ctx, setup.settings, setup.conn, cmd.number, cmd.args["agent-stack"] ?? "", cmd.author);
 					} else if (command === "awaiting-test" && cmd.isPull) {
 						const pr = await getPull(ctx, setup.conn, cmd.number);
 						if (!pr) return { success: true, ignored: "pull request not found" };
@@ -855,6 +1531,10 @@ const plugin: SandboxedPlugin = {
 				const next = applyOutcome(run, cb.status, cb.answer);
 				if (cb.prUrl && !next.prUrl) next.prUrl = cb.prUrl;
 				await putRun(ctx, next);
+				if (next.stack && next.status !== "queued" && next.status !== "running") {
+					const conn = await getConnection(ctx);
+					if (conn) await onRunFinished(ctx, settings, conn, next).catch((e) => ctx.log.error(`stack: run #${next.number} follow-up failed`, e));
+				}
 				return { success: true, status: next.status };
 			},
 		},
@@ -943,23 +1623,55 @@ const plugin: SandboxedPlugin = {
 				const labels = Array.isArray(input.labels) ? input.labels.map(String) : [];
 				const text = typeof input.body === "string" ? input.body : "";
 				const agent = input.agent !== false;
+				const on = Number.isInteger(Number(input.on)) && Number(input.on) > 0 ? Number(input.on) : null;
 				const issue = await createIssue(ctx, setup.conn, {
 					title,
-					body: agent && !commandsIn(text).includes("agent-issue") ? `${text.trimEnd()}\n\n/agent-issue` : text,
+					body: agent && !commandsIn(text).includes("agent-issue") ? `${text.trimEnd()}\n\n/agent-issue${on ? ` on #${on}` : ""}` : text,
 					labels,
 				});
 				return {
 					success: true,
 					issue,
 					agent,
+					...(on ? { on } : {}),
 					next: agent
-						? "The coding agent starts when GitHub delivers the event: it opens a pull request, the platform builds and tests it, hosts a preview, and merges it when every check passes; the site rebuilds a minute or two later. Use issue_status to follow it."
+						? on
+							? `The coding agent starts on it as a layer on top of #${on}'s pull request (from that branch) as soon as GitHub delivers the event; the stack merges bottom-up once every layer is green. Use issue_status to follow it.`
+							: "The coding agent starts when GitHub delivers the event: it opens a pull request, the platform builds and tests it, hosts a preview, and merges it when every check passes; the site rebuilds a minute or two later. Use issue_status to follow it."
 						: "Created without handing it to the agent.",
 				};
 			},
 		},
 
-		/** Where one issue stands: agent run, its PR build, and the site's latest build. */
+		/** Open several issues as one stack of layers (bottom first) and start it. */
+		"stacks/create": {
+			permission: "content:edit_own",
+			handler: async (routeCtx, ctx) => {
+				const setup = await requireSetup(ctx);
+				if (!setup.ok) return { success: false, error: setup.error };
+				const input = isRecord(routeCtx.input) ? routeCtx.input : {};
+				const specs = (Array.isArray(input.issues) ? input.issues : [])
+					.map((i) => (isRecord(i) ? { title: String(i.title ?? "").trim(), body: typeof i.body === "string" ? i.body : "" } : null))
+					.filter((i): i is { title: string; body: string } => !!i);
+				if (specs.length < 2 || specs.length > 10 || specs.some((i) => !i.title)) {
+					return { success: false, error: "Two to ten issues with titles are required, bottom first." };
+				}
+				const labels = Array.isArray(input.labels) ? input.labels.map(String) : [];
+				const created: Issue[] = [];
+				for (const spec of specs) created.push(await createIssue(ctx, setup.conn, { title: spec.title, body: spec.body, labels }));
+				const user: Record<string, unknown> = isRecord(routeCtx.user) ? routeCtx.user : {};
+				const r = await startStack(ctx, setup.settings, setup.conn, created.map((i) => i.number), String(user.email ?? user.name ?? setup.conn.owner));
+				if ("error" in r) return { success: false, error: r.error, issues: created };
+				return {
+					success: true,
+					stack: stackView(r.stack),
+					issues: created,
+					next: "Layer 1 is with the agent; each next layer starts when the one below opens its pull request. The platform builds every layer and merges the stack bottom-up once every layer is green; the site rebuilds a minute or two after the merge. Use issue_status on any layer to follow it.",
+				};
+			},
+		},
+
+		/** Where one issue stands: agent run, its PR build, its stack, and the site's latest build. */
 		"issues/status": {
 			permission: "content:edit_own",
 			handler: async (routeCtx, ctx) => {
@@ -973,15 +1685,17 @@ const plugin: SandboxedPlugin = {
 				const run = await getRun(ctx, number);
 				const pull = (await listBuilds(ctx, 100)).find((b) => b.pr > 0 && b.issue === number) ?? null;
 				const site = await getBranchBuild(ctx, setup.conn.branch);
+				const stack = await stackOf(ctx, run);
 				return {
 					success: true,
 					issue: { number: issue.number, title: issue.title, url: issue.url },
 					agent: run
-						? { status: run.status, attempt: run.attempt, prUrl: run.prUrl ?? null, reason: run.reason ?? null, answer: run.answer ?? null }
+						? { status: run.status, attempt: run.attempt, prUrl: run.prUrl ?? null, reason: run.reason ?? null, answer: run.answer ?? null, ...(run.stack ? { stack: run.stack, layer: run.layer ?? null, base: run.base ?? null } : {}) }
 						: { status: "not started" },
 					pullRequest: pull
-						? { number: pull.pr, status: pull.status, attempt: pull.attempt, previewUrl: pull.previewUrl ?? null, summary: pull.summary ?? null, staticBranch: pull.staticBranch }
+						? { number: pull.pr, status: pull.status, attempt: pull.attempt, previewUrl: pull.previewUrl ?? null, summary: pull.summary ?? null, staticBranch: pull.staticBranch, baseRef: pull.baseRef ?? null }
 						: null,
+					stack: stack ? stackView(stack) : null,
 					site: site ? { status: site.status, summary: site.summary ?? null, staticBranch: site.staticBranch, staticSha: site.staticSha ?? null } : null,
 				};
 			},
@@ -1061,19 +1775,27 @@ const plugin: SandboxedPlugin = {
 					const title = typeof v.title === "string" ? v.title.trim() : "";
 					if (!title) return buildPage(ctx, "A title is required.");
 					const text = typeof v.body === "string" ? v.body : "";
+					const on = Number.isInteger(Number(v.on)) && Number(v.on) > 0 ? Number(v.on) : null;
 					try {
 						const issue = await createIssue(ctx, setup.conn, {
 							title,
-							body: v.agent === true ? `${text.trimEnd()}\n\n/agent-issue` : text,
+							body: v.agent === true ? `${text.trimEnd()}\n\n/agent-issue${on ? ` on #${on}` : ""}` : text,
 							labels: [],
 						});
 						return buildPage(
 							ctx,
-							`Issue #${issue.number} created${v.agent === true ? " — the agent starts as soon as GitHub delivers the event" : ""}.`,
+							`Issue #${issue.number} created${v.agent === true ? ` — the agent starts${on ? ` on top of #${on}'s pull request` : ""} as soon as GitHub delivers the event` : ""}.`,
 						);
 					} catch (error) {
 						return buildPage(ctx, String(error));
 					}
+				}
+				if (i.type === "form_submit" && i.action_id === "run_stack") {
+					const setup = await requireSetup(ctx);
+					if (!setup.ok) return buildPage(ctx, setup.error);
+					const issues = issueRefs(String(i.values?.issues ?? ""));
+					const r = await startStack(ctx, setup.settings, setup.conn, issues, "admin");
+					return buildPage(ctx, "error" in r ? `Stack not started: ${r.error}.` : `Stack ${describeStack(r.stack)} started (${r.stack.id}) — layer 1 is with the agent.`);
 				}
 				if (i.type === "form_submit" && i.action_id === "run_issue") {
 					const setup = await requireSetup(ctx);
@@ -1119,6 +1841,7 @@ export default plugin;
 // ── Admin page ───────────────────────────────────────────────────────────
 
 const STATUS_LABEL: Record<Run["status"], string> = {
+	waiting: "waiting (stack)",
 	queued: "queued",
 	running: "working",
 	completed: "done",
@@ -1143,7 +1866,7 @@ async function buildPage(ctx: PluginContext, notice?: string) {
 	} else {
 		blocks.push({
 			type: "context",
-			text: `Repository ${conn.owner}/${conn.repo} (${conn.branch}). Whitelisted users drive the agent with comments: /agent-issue on an issue, /awaiting-test on a pull request; the runner answers with /check-…, /test-…, /preview-ready, /preview-test-… and /merged${settings.enabled ? "" : " — currently OFF"}.`,
+			text: `Repository ${conn.owner}/${conn.repo} (${conn.branch}). Whitelisted users drive the agent with comments: /agent-issue on an issue, /agent-stack #a #b … to run issues as stacked layers (/agent-issue on #N adds a layer), /awaiting-test on a pull request; the runner answers with /check-…, /test-…, /preview-ready, /preview-test-… and /merged${settings.enabled ? "" : " — currently OFF"}.`,
 		});
 		if (settings.allowedUsers.length === 0) {
 			blocks.push({
@@ -1268,6 +1991,47 @@ async function buildPage(ctx: PluginContext, notice?: string) {
 				updated: b.updatedAt,
 			})),
 		});
+		const stacks = await listStacks(ctx, 20);
+		blocks.push({ type: "divider" });
+		blocks.push({
+			type: "section",
+			text: "Stacks: issues run as layers — each pull request from the branch of the one below, linked as a GitHub stack, merged bottom-up once every layer is green (/agent-stack #a #b …, or /agent-issue on #N).",
+		});
+		blocks.push({
+			type: "table",
+			block_id: "stacks",
+			page_action_id: "stacks_page",
+			empty_text: "No stacks yet.",
+			columns: [
+				{ key: "id", label: "Stack", format: "code" },
+				{ key: "layers", label: "Layers (bottom first)", format: "text" },
+				{ key: "prs", label: "Pull requests", format: "text" },
+				{ key: "status", label: "Status", format: "badge" },
+				{ key: "summary", label: "Where it stands", format: "text" },
+				{ key: "updated", label: "Updated", format: "relative_time" },
+			],
+			rows: stacks.map((s) => ({
+				id: s.id,
+				layers: describeStack(s),
+				prs: s.issues.map((n) => (prOf(s, n) ? `#${prOf(s, n)}` : "…")).join(" → ") + (s.github ? ` (GitHub stack #${s.github})` : ""),
+				status: s.status,
+				summary: s.summary ?? "",
+				updated: s.updatedAt,
+			})),
+		});
+		blocks.push({
+			type: "form",
+			block_id: "run-stack",
+			fields: [
+				{
+					type: "text_input",
+					action_id: "issues",
+					label: "Run issues as a stack — numbers, bottom first",
+					placeholder: "12 13 14",
+				},
+			],
+			submit: { label: "Start stack", action_id: "run_stack" },
+		});
 		blocks.push({
 			type: "form",
 			block_id: "build-pr",
@@ -1290,6 +2054,13 @@ async function buildPage(ctx: PluginContext, notice?: string) {
 					label: "Hand to the agent",
 					description: "Ends the issue body with /agent-issue.",
 					initial_value: true,
+				},
+				{
+					type: "number_input",
+					action_id: "on",
+					label: "Stack on issue # (optional)",
+					description: "Makes it a layer on top of that issue's pull request: /agent-issue on #N.",
+					min: 1,
 				},
 			],
 			submit: { label: "Create issue", action_id: "create_issue" },
