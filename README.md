@@ -172,7 +172,9 @@ issue, one PR, one fix branch, one static branch; a green PR is merged.
 Routes: `webhook` (platform-authenticated: `issues` + `pull_request` events),
 `agent-callback` / `ci-callback` (public, HMAC-signed), and admin-authenticated
 `issues`, `issues/create`, `issues/run`, `issues/comment`, `pulls`,
-`pulls/build`, `poll`, `settings`, `settings/save`.
+`pulls/build`, `poll`, `settings`. Settings (whitelist, build attempts, auto-merge, model) live on the
+plugin's Settings page under Plugins → GitHub Agent; the GitHub Agent page is for issues, pull
+requests and stacks.
 
 The platform's GitHub App needs **Issues: read & write**, **Pull requests: read
 & write**, **Commit statuses: read & write**, and must subscribe to the

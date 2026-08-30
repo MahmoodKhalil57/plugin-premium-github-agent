@@ -87,7 +87,7 @@ import {
 	type Issue,
 	type PullRequest,
 } from "./github.js";
-import { DEFAULTS, ensureAgentKey, normalizeLogin, readSettings, saveSettings, type Settings } from "./settings.js";
+import { DEFAULTS, ensureAgentKey, normalizeLogin, readSettings, type Settings } from "./settings.js";
 import { decideMerge, describeStack, issueRefs, prNumberFrom, stackId, stackOnArg, type LayerState, type Stack } from "./stacks.js";
 
 const CALLBACK_PATH = "/_emdash/api/plugins/premium-github-agent/agent-callback";
@@ -1822,13 +1822,6 @@ const plugin: SandboxedPlugin = {
 			},
 		},
 
-		"settings/save": {
-			handler: async (routeCtx, ctx) => {
-				await saveSettings(ctx, isRecord(routeCtx.input) ? routeCtx.input : {});
-				const settings = await readSettings(ctx);
-				return { success: true, settings: { ...settings, agentKey: settings.agentKey ? "set" : "" } };
-			},
-		},
 
 		admin: {
 			handler: async (routeCtx, ctx) => {
@@ -1841,10 +1834,6 @@ const plugin: SandboxedPlugin = {
 				};
 				if (i.type === "page_load" && i.page === "widget:agent-runs") return buildWidget(ctx);
 				if (i.type === "page_load" && i.page === "widget:deployments") return buildDeploymentsWidget(ctx);
-				if (i.type === "form_submit" && i.action_id === "save_settings") {
-					await saveSettings(ctx, i.values ?? {});
-					return buildPage(ctx, "Settings saved.");
-				}
 				if (i.type === "form_submit" && i.action_id === "create_issue") {
 					const setup = await requireSetup(ctx);
 					if (!setup.ok) return buildPage(ctx, setup.error);
@@ -2147,46 +2136,8 @@ async function buildPage(ctx: PluginContext, notice?: string) {
 
 	blocks.push({ type: "divider" });
 	blocks.push({
-		type: "form",
-		block_id: "settings",
-		fields: [
-			{ type: "toggle", action_id: "enabled", label: "React to /commands", initial_value: settings.enabled },
-			{
-				type: "text_input",
-				action_id: "allowedUsers",
-				label: "Whitelisted GitHub users",
-				placeholder: "octocat, another-user",
-				initial_value: settings.allowedUsers.join(", "),
-			},
-			{
-				type: "number_input",
-				action_id: "maxBuildAttempts",
-				label: "Max build attempts per PR",
-				initial_value: settings.maxBuildAttempts,
-				min: 1,
-				max: 10,
-			},
-			{
-				type: "toggle",
-				action_id: "autoMerge",
-				label: "Auto-merge pull requests that pass every check",
-				description: "Squash-merges into the default branch, which rebuilds the site.",
-				initial_value: settings.autoMerge,
-			},
-			{ type: "text_input", action_id: "model", label: "Model", initial_value: settings.model },
-			{
-				type: "select",
-				action_id: "reasoning",
-				label: "Reasoning effort",
-				options: [
-					{ label: "High (slow, thorough)", value: "high" },
-					{ label: "Medium", value: "medium" },
-					{ label: "Low", value: "low" },
-				],
-				initial_value: settings.reasoning,
-			},
-		],
-		submit: { label: "Save settings", action_id: "save_settings" },
+		type: "context",
+		text: `${settings.enabled ? "Reacting to /commands" : "Not reacting to /commands (disabled)"} · whitelisted: ${settings.allowedUsers.length ? settings.allowedUsers.join(", ") : "nobody yet"} · ${settings.maxBuildAttempts} build attempts per PR · auto-merge ${settings.autoMerge ? "on" : "off"} · model ${settings.model} (${settings.reasoning}). Change these under Plugins → GitHub Agent → Settings.`,
 	});
 	return { blocks };
 }

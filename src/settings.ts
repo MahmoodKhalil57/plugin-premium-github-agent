@@ -58,24 +58,6 @@ export async function readSettings(ctx: PluginContext): Promise<Settings> {
 	};
 }
 
-export async function saveSettings(ctx: PluginContext, values: Record<string, unknown>): Promise<void> {
-	if (typeof values.enabled === "boolean") await ctx.kv.set(`${PREFIX}enabled`, values.enabled);
-	if (typeof values.allowedUsers === "string") {
-		await ctx.kv.set(`${PREFIX}allowedUsers`, parseUsers(values.allowedUsers).join(", "));
-	}
-	// The callback secret is the plugin's own; a submitted value replaces it (rotation).
-	if (typeof values.agentKey === "string" && values.agentKey.trim()) {
-		await ctx.kv.set(`${PREFIX}agentKey`, values.agentKey.trim());
-	}
-	if (typeof values.model === "string") await ctx.kv.set(`${PREFIX}model`, values.model.trim() || DEFAULTS.model);
-	if (values.reasoning === "low" || values.reasoning === "medium" || values.reasoning === "high") {
-		await ctx.kv.set(`${PREFIX}reasoning`, values.reasoning);
-	}
-	if (values.maxBuildAttempts !== undefined) {
-		await ctx.kv.set(`${PREFIX}maxBuildAttempts`, clampAttempts(values.maxBuildAttempts));
-	}
-	if (typeof values.autoMerge === "boolean") await ctx.kv.set(`${PREFIX}autoMerge`, values.autoMerge);
-}
 
 /** Master switch: with `enabled` off, webhooks and manual runs are ignored. */
 

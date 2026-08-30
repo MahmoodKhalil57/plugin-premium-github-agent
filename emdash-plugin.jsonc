@@ -26,6 +26,44 @@
 	},
 
 	"admin": {
+		"settingsSchema": {
+			"enabled": {
+				"type": "boolean",
+				"label": "React to /commands",
+				"description": "Off: issue and pull-request comments are recorded but nothing runs.",
+				"default": true
+			},
+			"allowedUsers": {
+				"type": "string",
+				"label": "Whitelisted GitHub users",
+				"description": "Comma-separated GitHub logins whose /commands, issues and pull requests the agent acts on."
+			},
+			"maxBuildAttempts": {
+				"type": "number",
+				"label": "Max build attempts per PR",
+				"description": "How many fix → build → test rounds a pull request gets before the agent stops retrying.",
+				"default": 3,
+				"min": 1,
+				"max": 10
+			},
+			"autoMerge": {
+				"type": "boolean",
+				"label": "Auto-merge pull requests that pass every check",
+				"description": "Squash-merges into the default branch, which rebuilds the site.",
+				"default": true
+			},
+			"model": { "type": "string", "label": "Model", "description": "Workers AI model id handed to the agent.", "default": "@cf/zai-org/glm-5.3-flash" },
+			"reasoning": {
+				"type": "select",
+				"label": "Reasoning effort",
+				"options": [
+					{ "value": "high", "label": "High (slow, thorough)" },
+					{ "value": "medium", "label": "Medium" },
+					{ "value": "low", "label": "Low" }
+				],
+				"default": "high"
+			}
+		},
 		"pages": [{ "path": "/github-agent", "label": "GitHub Agent", "icon": "git-pull-request" }],
 		"widgets": [
 			{ "id": "deployments", "title": "Deployments", "size": "half" },
