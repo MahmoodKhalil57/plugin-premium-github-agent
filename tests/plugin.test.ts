@@ -414,6 +414,14 @@ describe("default branch", () => {
 		expect(fields[0]?.value).toBe("site.example");
 	});
 
+	it("computes no preview URLs for a site served at the platform zone itself", async () => {
+		const { ctx, calls } = ctxWith({ github: conn, settings, fetch: async (url) => (url.endsWith("/ci") ? Response.json({ accepted: true }, { status: 202 }) : url.endsWith("/branches/main") ? Response.json({ commit: { sha: "mainsha" } }) : Response.json({})) });
+		(ctx.site as { platformUrl?: string }).platformUrl = "https://premium-cms.com";
+		await route("webhook")({ input: { ref: "refs/heads/main", after: "mainsha", repository: { full_name: "acme/site" } } }, ctx);
+		const ci = JSON.parse(String(calls.find((c) => c.url.endsWith("/ci"))?.init?.body));
+		expect(ci.previousUrls).toEqual([null, null]);
+	});
+
 	it("ignores pushes to other branches and to static/*", async () => {
 		const { ctx, calls } = ctxWith({ github: conn, settings });
 		for (const ref of ["refs/heads/static/main", "refs/heads/feature", "refs/tags/v1"]) {

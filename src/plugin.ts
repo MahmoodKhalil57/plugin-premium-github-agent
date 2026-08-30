@@ -417,8 +417,9 @@ function previewUrlFor(ctx: PluginContext, label: string): string | null {
 	} catch {
 		return null;
 	}
+	// `<rn>.<zone>` — the zone itself (a site served at the platform's apex) has no preview hostnames.
 	const dot = host.indexOf(".");
-	if (dot <= 0 || !/^[a-z0-9][a-z0-9-]{0,40}$/.test(label)) return null;
+	if (dot <= 0 || host.slice(dot + 1).split(".").length < 2 || !/^[a-z0-9][a-z0-9-]{0,40}$/.test(label)) return null;
 	return `https://${host.slice(0, dot)}--${label}${host.slice(dot)}`;
 }
 
