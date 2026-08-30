@@ -240,6 +240,11 @@ export async function servePagesFromBranch(
 		const msg = (r.json as { message?: string } | null)?.message ?? "";
 		return { ok: false, error: `GitHub ${r.status} configuring Pages${msg ? `: ${msg}` : ""}` };
 	}
+	// A source switch alone does not enqueue a legacy build — only a push to the
+	// source branch does — and the first deployment switches AFTER its push, so
+	// the Pages site would stay "Site not found" until the next build. Ask for
+	// one explicitly; best-effort (409 = one is already running).
+	await gh(ctx, conn, "POST", `/repos/${conn.owner}/${conn.repo}/pages/builds`).catch(() => undefined);
 	const after = await gh(ctx, conn, "GET", `/repos/${conn.owner}/${conn.repo}/pages`);
 	return { ok: true, url: (after.json as { html_url?: string } | null)?.html_url };
 }
