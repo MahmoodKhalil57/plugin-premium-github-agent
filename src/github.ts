@@ -12,7 +12,8 @@ export interface Connection {
 	repo: string;
 	branch: string;
 	/** Signs content-snapshot requests for builds; empty when the site has none. */
-	previewSecret: string;
+	/** The frontend service account's API token — the build reads the content snapshot with it (EMDASH_API_TOKEN). */
+	frontendToken: string;
 }
 
 export interface Issue {
@@ -82,7 +83,7 @@ function toIssue(raw: unknown): Issue | null {
 export async function getConnection(ctx: PluginContext): Promise<Connection | null> {
 	const c = await ctx.github?.get();
 	if (!c) return null;
-	return { ...c, previewSecret: (c as { previewSecret?: string }).previewSecret ?? "" };
+	return { ...c, frontendToken: (c as { frontendToken?: string }).frontendToken ?? "" };
 }
 
 /** Open issues (pull requests excluded), newest first. `label` narrows the list. */

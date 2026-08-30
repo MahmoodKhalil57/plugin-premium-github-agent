@@ -212,7 +212,7 @@ export async function dispatchCi(
 		owner: conn.owner,
 		repo: conn.repo,
 		token: conn.token,
-		previewSecret: conn.previewSecret,
+		apiToken: conn.frontendToken,
 		...build,
 		callback: { route: "ci-callback", secret: settings.agentKey },
 		stageRoute: "ci-stage",

@@ -17,7 +17,7 @@ const route = (name: string) => (plugin.routes![name] as { handler: Handler }).h
 
 function ctxWith(opts: {
 	settings?: Record<string, unknown>;
-	github?: { token: string; owner: string; repo: string; branch: string; previewSecret: string } | null;
+	github?: { token: string; owner: string; repo: string; branch: string; frontendToken: string } | null;
 	fetch?: (url: string, init?: RequestInit) => Promise<Response>;
 	/** Issues opted in to merging (`/auto-agent-merge`); merging is opt-in, so the mechanics tests opt everything in and the opt-in tests pass `[]`. */
 	optIn?: number[] | "all";
@@ -78,7 +78,7 @@ function ctxWith(opts: {
 	return { ctx, store, builds, stacks, calls, crons, kv };
 }
 
-const conn = { token: "gho_x", owner: "acme", repo: "site", branch: "main", previewSecret: "prev" };
+const conn = { token: "gho_x", owner: "acme", repo: "site", branch: "main", frontendToken: "ec_pat_frontend" };
 const settings = { allowedUsers: "alice", agentKey: "k", enabled: true };
 
 function issue(n: number, author: string, body = "") {
