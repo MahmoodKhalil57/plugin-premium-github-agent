@@ -5,10 +5,14 @@ labelled issues into **open** pull requests.
 
 - **Credential:** the site's own GitHub connection (Settings → General). Nothing
   else to paste; the PR is opened as the site owner.
-- **Runtime:** a Cloudflare Worker (`agent/`) running a
-  [Think](https://github.com/cloudflare/agents/tree/main/docs/think) agent on
-  Workers AI (`@cf/zai-org/glm-5.3-flash` by default) with GitHub's remote MCP
-  server. No GitHub Actions, no scripts — one bundled skill and MCP tools only.
+- **Runtime:** the instance itself. The plugin asks the platform for a
+  [Think](https://github.com/cloudflare/agents/tree/main/docs/think) agent
+  (`ctx.agents`, capability `agents:run`) on the instance's Workers AI
+  (`@cf/zai-org/glm-5.3-flash` by default) with GitHub's remote MCP server, and
+  for builds in the instance's sandbox container (`ctx.sandbox`, capability
+  `sandbox:build`). Nothing runs outside the site's own Worker, and every bill
+  lands on the account that hosts the instance. No GitHub Actions, no scripts —
+  one bundled skill and MCP tools only.
 - **Dry coding:** the agent reads the repo, writes a branch, opens a PR and
   comments on the issue. It never runs code or tests and never merges.
 - **Whitelist:** the agent only works on issues raised by the GitHub usernames
@@ -115,14 +119,14 @@ in the CI.
 ## Default branch: live, one back, two back
 
 Every successful build of the default branch is a deployment. Before the new
-`dist/` is pushed to `static/<default>` (what GitHub Pages serves), the worker
+`dist/` is pushed to `static/<default>` (what GitHub Pages serves), the build
 shifts the earlier deployments one slot back — `static/<default>-b-1` ← the
 build that was live, `static/<default>-b-2` ← the one before it — by moving
 refs through the GitHub API (no checkout, nothing rebuilt). Each kept slot is
-then hosted as its own assets-only Worker,
-`preview-<owner>-<repo>-<default>-b-1` / `-b-2` on `workers.dev`, straight
-from its branch, so there are always three things to look at: the live site,
-the previous deployment and the one before that. The slot branches and their
+served straight from its branch as `https://<rn>--<default>-b-1.premium-cms.com`
+/ `-b-2` (see "Previews come straight from git"), so there are always three
+things to look at: the live site, the previous deployment and the one before
+that. The slot branches and their
 preview URLs are on the site row in the admin page (and in the `site/build`
 route's `build.previous`). A build whose push never landed does not rotate
 again, so a retry cannot push the older snapshots out.
@@ -135,18 +139,17 @@ GitHub before anything happens. The App must subscribe to **Issues**,
 ## Pull requests: check → build → static branch → test
 
 Every pull request from a whitelisted author (the agent's own PRs included) is
-built in a Cloudflare container by the agent worker (`POST /ci`, Sandbox SDK):
+built in the instance's sandbox container (`ctx.sandbox.build`, Sandbox SDK):
 
 1. `npm run check:cf` (the site's static checks),
 2. `astro build` against the site's live content snapshot,
 3. `dist/` is force-pushed to `static/<branch>` — one branch per PR that always
    holds the latest build, so it can be served straight away later,
 4. `npm run test:cf`,
-5. when everything passed, the build is hosted on Cloudflare as an assets-only
-   Worker (`preview-<owner>-<repo>-pr<N>.<account>.workers.dev`) and the URL
-   is posted on the PR (comment + commit-status link). The preview is deleted
-   when the PR closes. The worker needs `CF_ACCOUNT_ID` / `CF_API_TOKEN`
-   secrets (Workers Scripts edit) for this; without them the step is skipped,
+5. when everything passed, the build waits until the git-served preview
+   (`https://<rn>--pr-<N>.premium-cms.com`) answers with the commit it pushed,
+   and the URL is posted on the PR (comment + commit-status link). The static
+   branch — and with it the preview — is deleted when the PR closes,
 6. `npm run test:preview:cf` runs against the live preview (`PREVIEW_URL`):
    the shipped test just fetches it; a project can put Playwright, Cloudflare
    Browser Rendering or anything else behind that script. A failure here goes
@@ -174,14 +177,19 @@ The platform's GitHub App needs **Issues: read & write**, **Pull requests: read
 **Issues** and **Pull request** events; each installation has to accept the
 permissions once.
 
-## The agent worker
+## The runtime
 
-`agent/` is a standalone Worker: `bun install && bunx wrangler deploy`, then
-`wrangler secret put AGENT_KEY` with the key you paste into the plugin settings.
-It needs a Workers Paid plan (Workers AI). The platform runs one shared instance
-at `https://premium-cms-issue-agent.premiumcms.workers.dev`; any deployment
-works as long as its URL host is allowed by the plugin manifest
-(`*.workers.dev`, `*.premium-cms.com`).
+There is nothing to deploy. The platform's instance bundle ships the agent
+runtime (`@premium-cms/cloudflare/agents`): a `PluginAgent` Durable Object per
+issue (`<plugin>:issue-<N>`, so every attempt lands on the same object and
+re-dispatching is idempotent), a `Sandbox` container per build lane
+(`pr-<N>` / `branch-<name>`), and Workers AI. The plugin reaches them through
+`ctx.agents.run / status` and `ctx.sandbox.build / buildStatus`; the runtime
+reports back by POSTing to the plugin's `agent-callback`, `ci-stage` and
+`ci-callback` routes through the instance's own service binding, signed with
+the plugin's agent key (generated on install, shown in the settings). The
+instance needs a Workers Paid plan (Workers AI, Durable Objects, Containers);
+the platform declares the bindings when it provisions or rolls a site.
 
 ## Repository context: `.agents/skills/` and `.mcp.json`
 
