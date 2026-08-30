@@ -100,8 +100,10 @@ The platform zone has a wildcard record and the router forwards
 `https://<rn>--<label>.premium-cms.com` to the instance `<rn>` with
 `X-Premium-Preview: <label>`; the instance serves `static/<label>` from the
 repository through the site's own GitHub connection (cached at the edge by
-commit; every response carries `X-Preview-Commit`, is `noindex`, and `/_emdash/*`
-answers 404 — a preview is the static site only). So:
+commit; every response carries `X-Preview-Commit` and is `noindex`). A signed-in
+editor gets the toolbar — and its plugins, the Site Agent included — on a preview
+too: the first visit bounces once through the site's own origin, which hands the
+session over to the preview hostname with a single-use ticket. So:
 
 | Branch | Preview |
 | --- | --- |
