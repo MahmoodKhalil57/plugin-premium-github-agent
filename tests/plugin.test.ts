@@ -156,7 +156,7 @@ describe("/agent-issue", () => {
 			fetch: async (url, init) => {
 				if (url.endsWith("/issues/4")) return Response.json(issue(4, "alice"));
 				if (url === "agents:run") {
-					attempts.push(JSON.parse(String(init?.body)).attempt);
+					attempts.push(JSON.parse(String(init?.body)).callback?.data?.attempt);
 					return Response.json({ submissionId: `s${attempts.length}`, accepted: true });
 				}
 				return Response.json({});
@@ -222,7 +222,7 @@ describe("/awaiting-test and the runner's reports", () => {
 				if (url.endsWith("/issues/1")) return Response.json(issue(1, "alice"));
 				if (url === "sandbox:build") return Response.json({ accepted: true }, { status: 202 });
 				if (url === "agents:run") {
-					runs.push(JSON.parse(String(init?.body)).note ?? "");
+					runs.push(JSON.parse(String(init?.body)).input ?? "");
 					return Response.json({ submissionId: `s${runs.length}`, accepted: true });
 				}
 				return Response.json({});
