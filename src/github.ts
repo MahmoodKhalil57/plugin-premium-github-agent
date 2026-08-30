@@ -158,6 +158,8 @@ export interface PullRequest {
 	draft: boolean;
 	merged: boolean;
 	updatedAt: string;
+	/** The description — where `Fixes #N` names the issue when the branch does not. */
+	body: string;
 	/** GitHub's stack membership, when the PR is part of one. */
 	stack: { number: number; size: number; position: number; base: string } | null;
 }
@@ -180,6 +182,7 @@ function toPull(raw: unknown): PullRequest | null {
 		draft: r.draft === true,
 		merged: r.merged === true || typeof r.merged_at === "string",
 		updatedAt: String(r.updated_at ?? ""),
+		body: typeof r.body === "string" ? r.body : "",
 		stack: toStackRef(r.stack),
 	};
 }

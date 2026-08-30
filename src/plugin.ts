@@ -143,6 +143,23 @@ function isStale(b: { status: string; updatedAt: string }): boolean {
 	return b.status === "running" && Date.now() - Date.parse(b.updatedAt) > STALE_BUILD_MS;
 }
 const AGENT_BRANCH = /^agent\/issue-(\d+)-/;
+/** `Fixes #12`, `Closes #12`, `Resolves #12` in a pull request description. */
+const CLOSES_RE = /\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s*:?\s+#(\d+)\b/i;
+
+/**
+ * The issue a pull request fixes: the agent's branch name (`agent/issue-N-…`),
+ * what an earlier build already recorded, the run that reported this PR as
+ * its result, or a `Fixes #N` in the description — the model does not always
+ * name its branch the way the skill asks.
+ */
+async function issueForPull(ctx: PluginContext, pr: PullRequest, known?: number): Promise<number | undefined> {
+	const fromBranch = Number(pr.headRef.match(AGENT_BRANCH)?.[1]);
+	if (fromBranch > 0) return fromBranch;
+	if (known && known > 0) return known;
+	for (const run of await listRuns(ctx, 100)) if (prNumberFrom(run.prUrl) === pr.number) return run.number;
+	const fromBody = Number(pr.body.match(CLOSES_RE)?.[1]);
+	return fromBody > 0 ? fromBody : undefined;
+}
 
 // ── Helpers ──────────────────────────────────────────────────────────────
 
@@ -331,8 +348,8 @@ async function refreshRun(ctx: PluginContext, settings: Settings, conn: Connecti
 		const s = await agentStatus(ctx, settings, conn, run.number, run.submissionId);
 		const next = applyOutcome(run, s.status, s.answer);
 		if (next !== run) await putRun(ctx, next);
-		if (next !== run && next.stack && next.status !== "queued" && next.status !== "running") {
-			await onRunFinished(ctx, settings, conn, next).catch((e) => ctx.log.error(`stack: run #${next.number} follow-up failed`, e));
+		if (next !== run && next.status !== "queued" && next.status !== "running") {
+			await onRunFinished(ctx, settings, conn, next).catch((e) => ctx.log.error(`run #${next.number} follow-up failed`, e));
 		}
 		return next;
 	} catch (error) {
@@ -557,7 +574,7 @@ async function buildPull(
 		await putBuild(ctx, capped);
 		return { started: false, reason: `reached ${settings.maxBuildAttempts} build attempts`, build: capped };
 	}
-	const issue = Number(pr.headRef.match(AGENT_BRANCH)?.[1]) || existing?.issue;
+	const issue = await issueForPull(ctx, pr, existing?.issue);
 	const run = Number.isInteger(issue) ? await getRun(ctx, issue as number) : null;
 	const build: Build = {
 		pr: pr.number,
@@ -739,7 +756,7 @@ async function agentFix(
 	command: Command,
 	body: string,
 ): Promise<{ started: boolean; reason?: string }> {
-	const issueNo = Number(pr.headRef.match(AGENT_BRANCH)?.[1]);
+	const issueNo = (await issueForPull(ctx, pr)) ?? Number.NaN;
 	if (!Number.isInteger(issueNo)) return { started: false, reason: "not an agent branch" };
 	const build = await getBuild(ctx, pr.number);
 	if (build && build.attempt >= settings.maxBuildAttempts) {
@@ -1102,8 +1119,11 @@ async function stopStack(ctx: PluginContext, conn: Connection, stack: Stack, rea
 	return next;
 }
 
-/** A run ended (callback or reconcile): record the layer's PR, link it, start the next layer, and see whether the stack can merge. */
+/** A run ended (callback or reconcile): build the PR it reported if the agent did not ask; for a stack layer, record and link the PR, start the next layer, and see whether the stack can merge. */
 async function onRunFinished(ctx: PluginContext, settings: Settings, conn: Connection, run: Run): Promise<void> {
+	// The agent is asked to comment /awaiting-test on its pull request; when it forgets, the platform builds it anyway.
+	const reported = run.status === "completed" ? prNumberFrom(run.prUrl) : null;
+	if (reported) await buildAgentPull(ctx, settings, conn, reported).catch((e) => ctx.log.warn(`PR #${reported}: could not start the build for #${run.number}`, e));
 	let stack = await stackOf(ctx, run);
 	if (!stack || stack.status !== "running") return;
 	const pr = run.status === "completed" ? prNumberFrom(run.prUrl) : null;
@@ -1125,6 +1145,17 @@ async function onRunFinished(ctx: PluginContext, settings: Settings, conn: Conne
 		return;
 	}
 	await stopStack(ctx, conn, stack, `#${run.number} produced no pull request (${why})`);
+}
+
+/** Build the pull request a run reported, unless that commit is already built or building. */
+async function buildAgentPull(ctx: PluginContext, settings: Settings, conn: Connection, number: number): Promise<void> {
+	const pr = await getPull(ctx, conn, number);
+	if (!pr || pr.state !== "open") return;
+	const build = await getBuild(ctx, number);
+	if (build && build.headSha === pr.headSha && build.status !== "failed") return;
+	const r = await buildPull(ctx, settings, conn, pr);
+	if (r.started) ctx.log.info(`PR #${number}: build started by the platform (attempt ${r.build?.attempt})`);
+	else ctx.log.info(`PR #${number}: not built by the platform: ${r.reason}`);
 }
 
 /** Link a freshly opened layer on top of the one below as a GitHub stack (created with the first pair, extended after). */
@@ -1734,9 +1765,9 @@ const plugin: SandboxedPlugin = {
 				const next = applyOutcome(run, cb.status, cb.answer);
 				if (cb.prUrl && !next.prUrl) next.prUrl = cb.prUrl;
 				await putRun(ctx, next);
-				if (next.stack && next.status !== "queued" && next.status !== "running") {
+				if (next.status !== "queued" && next.status !== "running") {
 					const conn = await getConnection(ctx);
-					if (conn) await onRunFinished(ctx, settings, conn, next).catch((e) => ctx.log.error(`stack: run #${next.number} follow-up failed`, e));
+					if (conn) await onRunFinished(ctx, settings, conn, next).catch((e) => ctx.log.error(`run #${next.number} follow-up failed`, e));
 				}
 				return { success: true, status: next.status };
 			},

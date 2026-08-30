@@ -672,6 +672,34 @@ describe("auto-merge is a human decision", () => {
 	});
 });
 
+describe("the platform does not depend on the agent's discipline", () => {
+	const world = (prBody = "") => async (url: string, init?: RequestInit) => {
+		if (url.endsWith("/pulls/10")) return Response.json({ ...pull(10, "alice", "fix/footer-typo"), body: prBody });
+		if (url.endsWith("/issues/4") && (!init?.method || init.method === "GET")) return Response.json(issue(4, "alice"));
+		if (url === "sandbox:build") return Response.json({ accepted: true }, { status: 202 });
+		if (url === "agents:run") return Response.json({ submissionId: "s1", accepted: true });
+		return Response.json({});
+	};
+
+	it("links a pull request to its issue by the run that reported it, whatever the branch is called", async () => {
+		const { ctx, builds } = ctxWith({ github: conn, settings, fetch: world(), optIn: [] });
+		await route("webhook")(commentEvent(4, "alice", "/agent-issue"), ctx);
+		await route("agent-callback")(await signed({ issue: 4, attempt: 1, submissionId: "s1", status: "completed", answer: "https://github.com/acme/site/pull/10", prUrl: null }, canonicalCallback), ctx);
+		// The run's completion already built the PR (the agent never commented /awaiting-test).
+		expect(builds.get("10")).toMatchObject({ issue: 4, status: "running", attempt: 1 });
+		// The agent's own /awaiting-test on the same commit is not a second build.
+		const r = (await route("webhook")(commentEvent(10, "alice", "/awaiting-test", true), ctx)) as { handled: Record<string, { started: boolean; reason?: string }> };
+		expect(r.handled["awaiting-test"].started).toBe(false);
+		expect(builds.get("10")).toMatchObject({ issue: 4, attempt: 1 });
+	});
+
+	it("links a pull request to its issue by `Fixes #N` in the description", async () => {
+		const { ctx, builds } = ctxWith({ github: conn, settings, fetch: world("## Summary\n\nFixes #4 by adding one line."), optIn: [] });
+		await route("webhook")(commentEvent(10, "alice", "/awaiting-test", true), ctx);
+		expect(builds.get("10")).toMatchObject({ issue: 4, status: "running" });
+	});
+});
+
 describe("stack helpers", () => {
 	it("parses command arguments", () => {
 		expect(stackOnArg("on #12")).toBe(12);
@@ -749,7 +777,7 @@ describe("/agent-stack", () => {
 		await route("ci-callback")(await signed({ ...ciResult(10, 1, true), branch: "agent/issue-1-x" }, canonicalCi), ctx);
 		expect(builds.get("10")).toMatchObject({ status: "passed", stack: stack.id, baseRef: "main" });
 		expect(gh.state.merges).toEqual([]);
-		expect(stacks.get(stack.id)).toMatchObject({ summary: "waiting for #11 to start building" });
+		expect(stacks.get(stack.id)).toMatchObject({ summary: "waiting for the build of #11" });
 
 		// PR 11 goes green too: one atomic stack merge of both, /merged on each, issues closed.
 		await route("webhook")(commentEvent(11, "alice", "/awaiting-test", true), ctx);

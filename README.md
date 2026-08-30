@@ -37,7 +37,11 @@ Everything is driven by `/commands` in issue and pull-request comments, from
 | runner   | `/preview-test-succeeded` · `/preview-test-failed` | `test:preview:cf` against the preview |
 | runner   | `/merged`                                  | squash-merged into the default branch (only after `/auto-agent-merge`) |
 
-A `/…-failed` report on the agent's own PR (`agent/issue-N-…`) sends the output
+The platform links a pull request to its issue by the agent's branch name
+(`agent/issue-N-…`), by the run that reported it, or by a `Fixes #N` in its
+description — and when the agent forgets to comment `/awaiting-test` on the
+pull request it opened, the platform builds it anyway. A `/…-failed` report on
+the agent's own PR sends the output
 back to the agent, which pushes a fix to the same branch and comments
 `/awaiting-test` again — bounded by **Max build attempts per PR**. Reports on a
 human's PR are informational; `/…-succeeded` never triggers anything. Pushes
