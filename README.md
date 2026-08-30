@@ -29,12 +29,13 @@ Everything is driven by `/commands` in issue and pull-request comments, from
 | you      | `/agent-issue` (issue body or comment)     | the agent studies the repo, opens a fix PR, and comments `/awaiting-test` on it |
 | you      | `/agent-stack #12 #13 …` (any issue), or bare `/agent-stack` on an issue with sub-issues | the issues run as stacked layers, bottom first — see below |
 | you      | `/agent-issue on #12`                      | this issue becomes one more layer on top of #12's stack (or its PR) |
+| you      | `/auto-agent-merge` · `/auto-agent-merge off` (issue body or comment, or a PR comment) | merge the pull request automatically once every check passes — off by default; your decision, not the agent's |
 | you/agent| `/awaiting-test` (PR comment)              | the platform runs the checks on the PR head |
 | runner   | `/check-succeeded` · `/check-failed`       | `check:cf` + `astro build` + push to `static/<branch>` |
 | runner   | `/test-succeeded` · `/test-failed`         | `test:cf` |
 | runner   | `/preview-ready <url>` · `/preview-build-failed` | the build hosted on Cloudflare |
 | runner   | `/preview-test-succeeded` · `/preview-test-failed` | `test:preview:cf` against the preview |
-| runner   | `/merged`                                  | squash-merged into the default branch (Auto-merge setting) |
+| runner   | `/merged`                                  | squash-merged into the default branch (only after `/auto-agent-merge`) |
 
 A `/…-failed` report on the agent's own PR (`agent/issue-N-…`) sends the output
 back to the agent, which pushes a fix to the same branch and comments
@@ -70,8 +71,10 @@ What happens, bottom-up:
 3. The plugin links the PRs as a GitHub stack (`POST /repos/…/stacks`, then
    `/stacks/{n}/add`); every PR shows the stack map on GitHub and is built,
    previewed and tested by the platform like any other.
-4. **Merging is bottom-up and atomic**: whenever the lowest open layer is green,
-   the longest run of green layers above it merges in one GitHub stack merge
+4. **Merging is bottom-up and atomic**: whenever the lowest open layer is green
+   and opted in (`/auto-agent-merge` on its issue — every layer in the run needs
+   it; a green layer nobody asked to merge holds the stack right there), the
+   longest run of green, opted-in layers above it merges in one GitHub stack merge
    (`PUT …/pulls/{n}/merge-async`, squash). The merge is held while the layer
    right above is building (or just opened and about to build) and while a
    planned layer has no PR yet, so GitHub never rebases a layer mid-build.
@@ -156,9 +159,15 @@ built in the instance's sandbox container (`ctx.sandbox.build`, Sandbox SDK):
    the shipped test just fetches it; a project can put Playwright, Cloudflare
    Browser Rendering or anything else behind that script. A failure here goes
    back to the agent like any other step,
-7. with every check green the PR is squash-merged into the default branch
-   (**Auto-merge** setting, on by default), whose push rebuilds `static/<default>`;
-   the preview is removed when the PR closes.
+7. with every check green the PR is squash-merged into the default branch —
+   **only if a human opted it in**: `/auto-agent-merge` in the issue body or a
+   later comment (on the issue or the PR), the "Merge automatically when
+   green" toggle when creating the issue in the admin, the per-issue toggle
+   there, or the MCP (`create_issue` with `autoMerge`, `set_auto_merge`).
+   Otherwise the green PR stays open with a comment saying so; opting in later
+   merges it right away. `/auto-agent-merge off` takes it back. The plugin
+   setting **Allow automatic merges** is only a master switch. The merge's push
+   rebuilds `static/<default>`; the preview is removed when the PR closes.
 
 The result is posted as a PR comment and a `premium-cms/ci` commit status. When
 the PR is the agent's own fix branch (`agent/issue-N-…`) and CI failed, the
@@ -172,7 +181,7 @@ issue, one PR, one fix branch, one static branch; a green PR is merged.
 Routes: `webhook` (platform-authenticated: `issues` + `pull_request` events),
 `agent-callback` / `ci-callback` (public, HMAC-signed), and admin-authenticated
 `issues`, `issues/create`, `issues/run`, `issues/comment`, `pulls`,
-`pulls/build`, `poll`, `settings`. Settings (whitelist, build attempts, auto-merge, model) live on the
+`pulls/build`, `poll`, `settings`. Settings (whitelist, build attempts, allow automatic merges, model) live on the
 plugin's Settings page under Plugins → GitHub Agent; the GitHub Agent page is for issues, pull
 requests and stacks.
 

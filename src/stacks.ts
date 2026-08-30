@@ -67,6 +67,8 @@ export interface LayerState {
 	updatedAt?: string;
 	/** The platform's latest build of that PR, if any. */
 	build: { status: string; headSha: string; updatedAt: string } | null;
+	/** A human asked for this layer to merge automatically (`/auto-agent-merge` on its issue or PR). Without it a green layer holds the stack. */
+	autoMerge?: boolean;
 }
 
 export type MergeDecision =
@@ -79,7 +81,9 @@ export type MergeDecision =
  * in one atomic stack merge — unless the layer right above it is about to be
  * built (its build is running, or it just changed and has no build yet), or a
  * planned layer has not opened its pull request yet. Merging under a layer in
- * flight would only make GitHub rebase it and throw that build away.
+ * flight would only make GitHub rebase it and throw that build away. Every
+ * layer in the run must have been opted in (`autoMerge`): a green layer nobody
+ * asked to merge holds the stack right there.
  */
 export function decideMerge(
 	layers: LayerState[],
@@ -97,6 +101,11 @@ export function decideMerge(
 	const prefix: LayerState[] = [];
 	for (const l of open) {
 		if (!green(l)) break;
+		// Merging is opt-in per layer: a green layer nobody asked to merge ends the run here.
+		if (l.autoMerge !== true) {
+			if (prefix.length === 0) return { kind: "hold", reason: `#${l.pr} is green but waits for /auto-agent-merge on #${l.issue}` };
+			break;
+		}
 		prefix.push(l);
 	}
 	if (prefix.length === 0) return { kind: "nothing", reason: `#${open[0].pr} is not green` };

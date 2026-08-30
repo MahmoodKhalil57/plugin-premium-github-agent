@@ -19,8 +19,12 @@ function ctxWith(opts: {
 	settings?: Record<string, unknown>;
 	github?: { token: string; owner: string; repo: string; branch: string; previewSecret: string } | null;
 	fetch?: (url: string, init?: RequestInit) => Promise<Response>;
+	/** Issues opted in to merging (`/auto-agent-merge`); merging is opt-in, so the mechanics tests opt everything in and the opt-in tests pass `[]`. */
+	optIn?: number[] | "all";
 }) {
 	const kv = new Map<string, unknown>(Object.entries(opts.settings ?? {}).map(([k, v]) => [`settings:${k}`, v]));
+	const optIn = opts.optIn ?? "all";
+	for (const n of optIn === "all" ? Array.from({ length: 99 }, (_, i) => i + 1) : optIn) kv.set(`automerge:issue:${n}`, true);
 	const store = new Map<string, Record<string, unknown>>();
 	const builds = new Map<string, Record<string, unknown>>();
 	const stacks = new Map<string, Record<string, unknown>>();
@@ -30,6 +34,7 @@ function ctxWith(opts: {
 		kv: {
 			get: async (k: string) => kv.get(k) ?? null,
 			set: async (k: string, v: unknown) => void kv.set(k, v),
+			delete: async (k: string) => kv.delete(k),
 			list: async (prefix: string) => [...kv.entries()].filter(([k]) => k.startsWith(prefix)).map(([key, value]) => ({ key, value })),
 		},
 		storage: {
@@ -70,7 +75,7 @@ function ctxWith(opts: {
 			buildStatus: async (id: string) => (await ctx.http.fetch(`sandbox:status?${id}`, { method: "GET" })).json(),
 		},
 	};
-	return { ctx, store, builds, stacks, calls, crons };
+	return { ctx, store, builds, stacks, calls, crons, kv };
 }
 
 const conn = { token: "gho_x", owner: "acme", repo: "site", branch: "main", previewSecret: "prev" };
@@ -305,7 +310,7 @@ describe("/awaiting-test and the runner's reports", () => {
 describe("MCP tools for assistants", () => {
 	it("declares create/list/status tools over author-level routes", () => {
 		const tools = (plugin as { mcp?: { tools: Record<string, { route: string }> } }).mcp?.tools ?? {};
-		expect(Object.keys(tools).sort()).toEqual(["create_issue", "create_stack", "issue_status", "list_issues"]);
+		expect(Object.keys(tools).sort()).toEqual(["create_issue", "create_stack", "issue_status", "list_issues", "set_auto_merge"]);
 		for (const t of Object.values(tools)) {
 			expect((plugin.routes![t.route] as { permission?: string }).permission).toBe("content:edit_own");
 		}
@@ -574,6 +579,99 @@ async function callback(ctx: unknown, issueNo: number, submissionId: string, prU
 	return route("agent-callback")(await signed({ issue: issueNo, attempt: 1, submissionId, status: "completed", answer, prUrl }, canonicalCallback), ctx);
 }
 
+describe("auto-merge is a human decision", () => {
+	/** PR 10 fixes issue 1 (branch agent/issue-1-x); everything the platform asks GitHub for succeeds. */
+	const green = (extra?: (url: string, init?: RequestInit) => Response | null) => async (url: string, init?: RequestInit) => {
+		const e = extra?.(url, init);
+		if (e) return e;
+		if (url.endsWith("/pulls/10")) return Response.json(pull(10, "alice", "agent/issue-1-x"));
+		if (url.endsWith("/pulls/10/merge")) return Response.json({ merged: true, sha: "merged1" });
+		if (url.endsWith("/issues/1") && (!init?.method || init.method === "GET")) return Response.json(issue(1, "alice"));
+		if (url === "sandbox:build") return Response.json({ accepted: true }, { status: 202 });
+		if (url === "agents:run") return Response.json({ submissionId: "s1", accepted: true });
+		return Response.json({});
+	};
+	const buildGreen = async (ctx: unknown) => {
+		await route("webhook")(commentEvent(10, "alice", "/awaiting-test", true), ctx as never);
+		await route("ci-callback")(await signed(ciResult(10, 1, true), canonicalCi), ctx as never);
+	};
+
+	it("a green pull request nobody opted in stays open, explained once", async () => {
+		const { ctx, builds, calls } = ctxWith({ github: conn, settings, fetch: green(), optIn: [] });
+		await buildGreen(ctx);
+		expect(builds.get("10")).toMatchObject({ status: "passed", mergeHeld: 1 });
+		const posted = commentsPosted(calls, 10);
+		expect(posted.some((b) => b.startsWith("/merged"))).toBe(false);
+		expect(posted.filter((b) => /not merged/.test(b))).toHaveLength(1);
+		expect(posted.find((b) => /not merged/.test(b))).toMatch(/`\/auto-agent-merge`/);
+		expect(calls.some((c) => c.url.endsWith("/pulls/10/merge"))).toBe(false);
+	});
+
+	it("/auto-agent-merge on the issue afterwards merges the green pull request right away; `off` takes it back", async () => {
+		const { ctx, builds, calls, kv } = ctxWith({ github: conn, settings, fetch: green(), optIn: [] });
+		await buildGreen(ctx);
+		const r = (await route("webhook")(commentEvent(1, "alice", "Looks good.\n/auto-agent-merge"), ctx)) as { handled: Record<string, { on: boolean; pr: number | null; merged: boolean }> };
+		expect(r.handled["auto-agent-merge"]).toMatchObject({ on: true, pr: 10, merged: true });
+		expect(kv.get("automerge:issue:1")).toBe(true);
+		expect(builds.get("10")).toMatchObject({ status: "merged" });
+		expect(commentsPosted(calls, 10).some((b) => b.startsWith("/merged"))).toBe(true);
+		expect(commentsPosted(calls, 1).some((b) => /Auto-merge on \(@alice\)/.test(b) && /merged/.test(b))).toBe(true);
+		const off = (await route("webhook")(commentEvent(1, "alice", "/auto-agent-merge off"), ctx)) as { handled: Record<string, { on: boolean }> };
+		expect(off.handled["auto-agent-merge"].on).toBe(false);
+		expect(kv.get("automerge:issue:1")).toBeUndefined();
+		expect(commentsPosted(calls, 1).some((b) => /Auto-merge off/.test(b))).toBe(true);
+	});
+
+	it("/auto-agent-merge in the issue body counts, and an opted-in issue merges when green", async () => {
+		const { ctx, builds, calls, kv } = ctxWith({ github: conn, settings, fetch: green(), optIn: [] });
+		const opened = { input: { action: "opened", issue: issue(1, "alice", "Fix the footer.\n\n/agent-issue\n/auto-agent-merge"), repository: { full_name: "acme/site" } } };
+		const r = (await route("webhook")(opened, ctx)) as { handled: Record<string, unknown> };
+		expect(Object.keys(r.handled).sort()).toEqual(["agent-issue", "auto-agent-merge"]);
+		expect(kv.get("automerge:issue:1")).toBe(true);
+		await buildGreen(ctx);
+		expect(builds.get("10")).toMatchObject({ status: "merged" });
+		expect(commentsPosted(calls, 10).some((b) => b.startsWith("/merged"))).toBe(true);
+	});
+
+	it("the create route writes /auto-agent-merge into the body only when asked, and the route toggle merges a green PR", async () => {
+		const created: string[] = [];
+		const fetch = green((url, init) => {
+			if (url.endsWith("/issues") && init?.method === "POST") {
+				created.push(JSON.parse(String(init.body)).body);
+				return Response.json(issue(created.length === 1 ? 1 : 2, "alice"));
+			}
+			if (url.endsWith("/issues/2")) return Response.json(issue(2, "alice"));
+			return null;
+		});
+		const { ctx, builds, kv } = ctxWith({ github: conn, settings, fetch, optIn: [] });
+		const a = (await route("issues/create")({ input: { title: "Footer", body: "Fix it.", autoMerge: true }, user: { name: "Mahmood" } }, ctx)) as { autoMerge: boolean; issue: { number: number } };
+		expect(a).toMatchObject({ autoMerge: true, issue: { number: 1 } });
+		expect(created[0]).toMatch(/\n\/agent-issue\n\/auto-agent-merge$/);
+		expect(kv.get("automerge:issue:1")).toBe(true);
+		const b = (await route("issues/create")({ input: { title: "Header", body: "Fix that." }, user: {} }, ctx)) as { autoMerge: boolean; next: string };
+		expect(b.autoMerge).toBe(false);
+		expect(created[1]).toMatch(/\n\/agent-issue$/);
+		expect(created[1]).not.toMatch(/auto-agent-merge/);
+		expect(b.next).toMatch(/waits for a human/);
+		expect(kv.get("automerge:issue:2")).toBeUndefined();
+		// Forgot the toggle: the route (the admin form and the MCP tool use it) opts the issue in and merges the green PR.
+		kv.delete("automerge:issue:1");
+		await buildGreen(ctx);
+		expect(builds.get("10")).toMatchObject({ status: "passed" });
+		const t = (await route("issues/auto-merge")({ input: { number: 1, enabled: true }, user: { name: "Mahmood" } }, ctx)) as { success: boolean; autoMerge: boolean; pr: number | null; merged: boolean };
+		expect(t).toMatchObject({ success: true, autoMerge: true, pr: 10, merged: true });
+		expect(builds.get("10")).toMatchObject({ status: "merged" });
+	});
+
+	it("the plugin setting is only a master switch: off, nothing merges even when opted in", async () => {
+		const { ctx, builds, calls } = ctxWith({ github: conn, settings: { ...settings, autoMerge: false }, fetch: green(), optIn: [1] });
+		await buildGreen(ctx);
+		expect(builds.get("10")).toMatchObject({ status: "passed" });
+		expect(commentsPosted(calls, 10).some((b) => b.startsWith("/merged") || /not merged/.test(b))).toBe(false);
+		expect(calls.some((c) => c.url.endsWith("/pulls/10/merge"))).toBe(false);
+	});
+});
+
 describe("stack helpers", () => {
 	it("parses command arguments", () => {
 		expect(stackOnArg("on #12")).toBe(12);
@@ -588,10 +686,11 @@ describe("stack helpers", () => {
 
 	it("merges the longest green run from the bottom, never under a layer in flight", () => {
 		const now = Date.parse("2026-01-01T12:00:00Z");
-		const L = (pr: number, build: string | null, opts: { sha?: string; state?: "open" | "merged" | "closed"; fresh?: boolean } = {}) => ({
+		const L = (pr: number, build: string | null, opts: { sha?: string; state?: "open" | "merged" | "closed"; fresh?: boolean; optIn?: boolean } = {}) => ({
 			issue: pr, pr, state: opts.state ?? ("open" as const), headSha: "h", headRef: `b${pr}`,
 			updatedAt: opts.fresh ? new Date(now - 1000).toISOString() : "2026-01-01T00:00:00Z",
 			build: build ? { status: build, headSha: opts.sha ?? "h", updatedAt: new Date(now - 60_000).toISOString() } : null,
+			autoMerge: opts.optIn ?? true,
 		});
 		const o = { plannedPending: false, now, staleMs: 30 * 60_000, freshMs: 10 * 60_000 };
 		expect(decideMerge([L(1, "passed"), L(2, "passed")], o)).toMatchObject({ kind: "merge", prs: [1, 2] });
@@ -603,6 +702,9 @@ describe("stack helpers", () => {
 		expect(decideMerge([L(1, "passed")], { ...o, plannedPending: true })).toMatchObject({ kind: "hold" });
 		expect(decideMerge([L(1, "merged", { state: "merged" }), L(2, "passed")], o)).toMatchObject({ kind: "merge", prs: [2] });
 		expect(decideMerge([L(1, "passed", { state: "closed" }), L(2, "passed")], o)).toMatchObject({ kind: "hold" });
+		// Merging is opt-in per layer: a green layer nobody asked to merge ends the run — or holds the stack when it is the bottom.
+		expect(decideMerge([L(1, "passed", { optIn: false }), L(2, "passed")], o)).toMatchObject({ kind: "hold", reason: expect.stringContaining("/auto-agent-merge") });
+		expect(decideMerge([L(1, "passed"), L(2, "passed", { optIn: false }), L(3, "passed")], o)).toMatchObject({ kind: "merge", prs: [1] });
 	});
 });
 

@@ -48,8 +48,8 @@
 			},
 			"autoMerge": {
 				"type": "boolean",
-				"label": "Auto-merge pull requests that pass every check",
-				"description": "Squash-merges into the default branch, which rebuilds the site.",
+				"label": "Allow automatic merges",
+				"description": "Merging is opted in per issue or pull request with /auto-agent-merge (a comment, the create-issue toggle, or the MCP). Off: nothing is ever merged automatically, opted in or not.",
 				"default": true
 			},
 			"model": { "type": "string", "label": "Model", "description": "Workers AI model id handed to the agent.", "default": "@cf/zai-org/glm-5.3-flash" },

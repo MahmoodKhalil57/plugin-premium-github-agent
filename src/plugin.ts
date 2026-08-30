@@ -97,6 +97,7 @@ const CI_CALLBACK_PATH = "/_emdash/api/plugins/premium-github-agent/ci-callback"
 const COMMANDS = [
 	"agent-issue",
 	"agent-stack",
+	"auto-agent-merge",
 	"awaiting-test",
 	"check-succeeded",
 	"check-failed",
@@ -181,6 +182,54 @@ async function listRuns(ctx: PluginContext, limit = 50): Promise<Run[]> {
 	return r.items.map((i) => i.data).filter(isRun);
 }
 
+// ── Auto-merge is a human decision ───────────────────────────────────────
+//
+// A green pull request is merged only when someone opted it in: `/auto-agent-merge`
+// in the issue body or a later comment (on the issue or the pull request), the
+// "merge automatically" toggle when creating an issue in the admin, the
+// per-issue toggle there, or the MCP (`create_issue` with autoMerge,
+// `set_auto_merge`). `/auto-agent-merge off` takes it back. The flag lives in
+// kv so it can be set before any run exists; the plugin setting is only a
+// master switch.
+function autoMergeKey(kind: "issue" | "pr", number: number): string {
+	return `automerge:${kind}:${number}`;
+}
+
+async function getAutoMergeFlag(ctx: PluginContext, kind: "issue" | "pr", number: number): Promise<boolean> {
+	return (await ctx.kv.get(autoMergeKey(kind, number))) === true;
+}
+
+async function setAutoMergeFlag(ctx: PluginContext, kind: "issue" | "pr", number: number, on: boolean): Promise<void> {
+	if (on) await ctx.kv.set(autoMergeKey(kind, number), true);
+	else await ctx.kv.delete(autoMergeKey(kind, number));
+}
+
+/** Issue numbers currently opted in (one kv call, for lists). */
+async function autoMergeIssues(ctx: PluginContext): Promise<Set<number>> {
+	const out = new Set<number>();
+	for (const e of await ctx.kv.list("automerge:issue:")) if (e.value === true) out.add(Number(e.key.slice("automerge:issue:".length)));
+	return out;
+}
+
+/** `/auto-agent-merge`, `/auto-agent-merge on` → true; `off` / `no` / `false` / `stop` → false. */
+function autoMergeArg(args: string | undefined): boolean {
+	const a = (args ?? "").trim().toLowerCase();
+	return !(a === "off" || a === "false" || a === "no" || a === "stop");
+}
+
+/** May this green pull request merge: the master switch, and the opt-in of the PR itself or of the issue it fixes. */
+async function mergeWanted(ctx: PluginContext, settings: Settings, build: Pick<Build, "pr" | "issue">): Promise<boolean> {
+	if (!settings.autoMerge) return false;
+	if (await getAutoMergeFlag(ctx, "pr", build.pr)) return true;
+	return build.issue ? getAutoMergeFlag(ctx, "issue", build.issue) : false;
+}
+
+function mergeHeldMessage(build: Pick<Build, "issue">, conn: Connection): string {
+	const where = build.issue ? `on issue #${build.issue} or on this pull request` : "on this pull request";
+	return `Every check passed — not merged: nobody asked for this pull request to merge automatically. To merge it into \`${conn.branch}\` automatically, comment \`/auto-agent-merge\` ${where}, switch it on in the admin (GitHub Agent → Auto-merge), or ask the assistant; or merge it yourself.`;
+}
+
+
 function allowed(settings: Settings, author: string): boolean {
 	return settings.allowedUsers.includes(normalizeLogin(author));
 }
@@ -215,6 +264,15 @@ async function requireSetup(
  * and manual runs alike — an unlisted author is recorded as skipped.
  * `again` retries an issue whose previous run already finished.
  */
+/** The issue body plus the commands the platform reacts to: `/agent-issue [on #N]`, and `/auto-agent-merge` when a human asked for it. */
+function issueBodyWithCommands(text: string, opts: { agent: boolean; on: number | null; autoMerge: boolean }): string {
+	if (!opts.agent) return text;
+	const lines: string[] = [];
+	if (!commandsIn(text).includes("agent-issue")) lines.push(`/agent-issue${opts.on ? ` on #${opts.on}` : ""}`);
+	if (opts.autoMerge && !commandsIn(text).includes("auto-agent-merge")) lines.push("/auto-agent-merge");
+	return lines.length ? `${text.trimEnd()}\n\n${lines.join("\n")}` : text;
+}
+
 async function runIssue(
 	ctx: PluginContext,
 	settings: Settings,
@@ -363,6 +421,8 @@ interface Build {
 	stack?: string;
 	/** The stack merge was announced on this PR (`/merged`, issue closed) — set only by the announcer, so a `closed` webhook racing it cannot suppress the comment. */
 	announced?: boolean;
+	/** The attempt whose green build was left open because nobody opted the PR into merging (the explanation was posted once). */
+	mergeHeld?: number;
 	/** Branch builds: another build was requested while this one ran. */
 	rebuild?: boolean;
 	/** Branch builds: the deployments before the live one (`-b-1`, `-b-2`) and their preview Workers. */
@@ -591,31 +651,83 @@ async function recordCi(ctx: PluginContext, settings: Settings, conn: Connection
 		await comment(ctx, conn, r.pr, `Build attempts exhausted (${settings.maxBuildAttempts}); a human needs to take it from here.`).catch(() => undefined);
 	}
 
-	if (r.ok && settings.autoMerge) {
-		// A layer of a stack: the stack decides (bottom-up, atomic), not this PR alone.
+	if (r.ok) {
+		// A layer of a stack: the stack decides (bottom-up, atomic, every layer opted in), not this PR alone.
 		const stack = (next.stack ? await getStack(ctx, next.stack) : null) ?? (await stackWithPull(ctx, r.pr));
 		if (stack && stack.status !== "merged") {
 			await settleStack(ctx, settings, conn, stack);
 			return (await getBuild(ctx, r.pr)) ?? next;
 		}
-		if (next.baseRef && next.baseRef !== conn.branch) {
-			await comment(ctx, conn, r.pr, `Not merged automatically: this pull request targets \`${next.baseRef}\`, not \`${conn.branch}\`. Link it as a stack (\`gh stack link\`) or retarget it.`).catch(() => undefined);
+		if (!(await mergeWanted(ctx, settings, next))) {
+			if (settings.autoMerge && next.mergeHeld !== r.attempt) {
+				next = { ...next, mergeHeld: r.attempt };
+				await putBuild(ctx, next);
+				await comment(ctx, conn, r.pr, mergeHeldMessage(next, conn)).catch(() => undefined);
+			}
 			return next;
 		}
-		const m: { merged: boolean; sha?: string; message: string } = await mergePull(ctx, conn, r.pr, build.title).catch(
-			(e) => ({ merged: false, message: String(e) }),
-		);
-		if (m.merged) {
-			next = { ...next, status: "merged", summary: `merged into ${conn.branch}${m.sha ? ` @ ${m.sha.slice(0, 7)}` : ""}` };
-			await putBuild(ctx, next);
-			await comment(ctx, conn, r.pr, [`/merged`, `Every check passed — squash-merged into \`${conn.branch}\`${m.sha ? ` (${m.sha.slice(0, 7)})` : ""}; \`${staticBranchFor(conn.branch)}\` rebuilds from it.`].join("\n")).catch(() => undefined);
-			ctx.log.info(`PR #${r.pr} merged into ${conn.branch}`, { sha: m.sha });
-		} else {
-			await comment(ctx, conn, r.pr, `Could not merge automatically: ${m.message}. The PR stays open for a human.`).catch(() => undefined);
-			ctx.log.warn(`PR #${r.pr}: auto-merge refused: ${m.message}`);
-		}
+		return mergeGreenPull(ctx, conn, next);
 	}
 	return next;
+}
+
+/** Squash-merge a green pull request (opted in, not a stack layer) and announce it. */
+async function mergeGreenPull(ctx: PluginContext, conn: Connection, build: Build): Promise<Build> {
+	let next = build;
+	if (next.baseRef && next.baseRef !== conn.branch) {
+		await comment(ctx, conn, next.pr, `Not merged automatically: this pull request targets \`${next.baseRef}\`, not \`${conn.branch}\`. Link it as a stack (\`gh stack link\`) or retarget it.`).catch(() => undefined);
+		return next;
+	}
+	const m: { merged: boolean; sha?: string; message: string } = await mergePull(ctx, conn, next.pr, build.title).catch(
+		(e) => ({ merged: false, message: String(e) }),
+	);
+	if (m.merged) {
+		next = { ...next, status: "merged", summary: `merged into ${conn.branch}${m.sha ? ` @ ${m.sha.slice(0, 7)}` : ""}` };
+		await putBuild(ctx, next);
+		await comment(ctx, conn, next.pr, [`/merged`, `Every check passed — squash-merged into \`${conn.branch}\`${m.sha ? ` (${m.sha.slice(0, 7)})` : ""}; \`${staticBranchFor(conn.branch)}\` rebuilds from it.`].join("\n")).catch(() => undefined);
+		ctx.log.info(`PR #${next.pr} merged into ${conn.branch}`, { sha: m.sha });
+	} else {
+		await comment(ctx, conn, next.pr, `Could not merge automatically: ${m.message}. The PR stays open for a human.`).catch(() => undefined);
+		ctx.log.warn(`PR #${next.pr}: auto-merge refused: ${m.message}`);
+	}
+	return next;
+}
+
+/** Someone opted an issue or pull request in (or out); when in and its build is already green, merge now. */
+async function setAutoMerge(
+	ctx: PluginContext,
+	settings: Settings,
+	conn: Connection,
+	kind: "issue" | "pr",
+	number: number,
+	on: boolean,
+	by: string,
+): Promise<{ on: boolean; pr: number | null; merged: boolean; note: string }> {
+	await setAutoMergeFlag(ctx, kind, number, on);
+	const build = kind === "pr" ? await getBuild(ctx, number) : ((await listBuilds(ctx, 100)).find((b) => b.pr > 0 && b.issue === number) ?? null);
+	const pr = build && build.pr > 0 ? build.pr : null;
+	let merged = false;
+	let note: string;
+	if (!on) {
+		note = `Auto-merge off (${by}): a green pull request stays open for a human.`;
+	} else if (!settings.autoMerge) {
+		note = `Auto-merge on for this ${kind === "pr" ? "pull request" : "issue"} (${by}) — but automatic merges are switched off for this site (GitHub Agent settings), so it still waits for a human.`;
+	} else if (build && build.status === "passed" && build.pr > 0) {
+		const stack = (build.stack ? await getStack(ctx, build.stack) : null) ?? (await stackWithPull(ctx, build.pr));
+		if (stack && stack.status !== "merged") {
+			await settleStack(ctx, settings, conn, stack);
+			merged = (await getBuild(ctx, build.pr))?.status === "merged";
+		} else {
+			merged = (await mergeGreenPull(ctx, conn, build)).status === "merged";
+		}
+		note = merged
+			? `Auto-merge on (${by}): every check had passed, so #${build.pr} was merged.`
+			: `Auto-merge on (${by}): #${build.pr} is green but could not be merged yet — see the pull request.`;
+	} else {
+		note = `Auto-merge on (${by}): the pull request merges as soon as every check passes.`;
+	}
+	await comment(ctx, conn, number, note).catch(() => undefined);
+	return { on, pr, merged, note };
 }
 
 /** A `/…-failed` report on the agent's own PR: hand the output back to the agent, if attempts remain. */
@@ -752,7 +864,7 @@ function commandEvent(
 	}
 	if (input.action !== "opened" || isPull) return null;
 	const body = String(issue.body ?? "");
-	const commands = commandsIn(body).filter((c) => c === "agent-issue" || c === "agent-stack");
+	const commands = commandsIn(body).filter((c) => c === "agent-issue" || c === "agent-stack" || c === "auto-agent-merge");
 	if (!commands.length) return null;
 	const user = isRecord(issue.user) ? issue.user : {};
 	return { number, isPull, author: String(user.login ?? ""), body, commands, args: commandArgs(body) };
@@ -1070,6 +1182,7 @@ async function stackLayers(ctx: PluginContext, conn: Connection, stack: Stack): 
 			headRef: pull.headRef,
 			updatedAt: pull.updatedAt,
 			build: b ? { status: b.status, headSha: b.headSha, updatedAt: b.updatedAt } : null,
+			autoMerge: (await getAutoMergeFlag(ctx, "issue", issue)) || (await getAutoMergeFlag(ctx, "pr", pr)),
 		});
 	}
 	return out;
@@ -1363,7 +1476,7 @@ const plugin: SandboxedPlugin = {
 		tools: {
 			create_issue: {
 				description:
-					"Open an issue on the site's connected GitHub repository. With agent=true (the default) the coding agent picks it up: it studies the repository, opens a pull request, the platform builds, tests and previews it, and merges it when every check passes; the site rebuilds afterwards. Describe the change precisely: what, where it shows on the page, the exact current text, what it should look like or do afterwards, acceptance criteria. `on` stacks the change on top of another issue's pull request (its branch) — for a change that depends on one still in flight; for a planned series use create_stack.",
+					"Open an issue on the site's connected GitHub repository. With agent=true (the default) the coding agent picks it up: it studies the repository, opens a pull request, the platform builds, tests and previews it. Merging is a human decision: the pull request merges automatically only with autoMerge=true (ask the user before setting it; set_auto_merge can change it later), otherwise it stays open once green. Describe the change precisely: what, where it shows on the page, the exact current text, what it should look like or do afterwards, acceptance criteria. `on` stacks the change on top of another issue's pull request (its branch) — for a change that depends on one still in flight; for a planned series use create_stack.",
 				route: "issues/create",
 				destructive: false,
 				input: schema(
@@ -1371,8 +1484,21 @@ const plugin: SandboxedPlugin = {
 						title: described(z.string().check(z.minLength(1), z.maxLength(200)), "Short imperative title"),
 						body: described(z.string().check(z.minLength(1)), "What to change and why, with acceptance criteria"),
 						agent: described(z.optional(z.boolean()), "Hand the issue to the coding agent (default true)"),
+						autoMerge: described(z.optional(z.boolean()), "Merge the pull request automatically once every check passes (default false — only when the user asked for it)"),
 						labels: z.optional(z.array(z.string())),
 						on: described(z.optional(z.int().check(z.positive())), "Stack this change on top of that issue's pull request (its branch)"),
+					}),
+				),
+			},
+			set_auto_merge: {
+				description:
+					"Switch automatic merging on or off for one issue's pull request (the same as /auto-agent-merge on the issue). Only when the user asked for it: merging is their decision. Switching it on when the pull request is already green merges it right away.",
+				route: "issues/auto-merge",
+				destructive: true,
+				input: schema(
+					z.object({
+						number: described(z.int().check(z.positive()), "The issue number"),
+						enabled: described(z.optional(z.boolean()), "true (default) to merge automatically when green, false to keep the pull request open for a human"),
 					}),
 				),
 			},
@@ -1384,7 +1510,7 @@ const plugin: SandboxedPlugin = {
 			},
 			create_stack: {
 				description:
-					"Open several issues as ONE stack of layers, bottom first, and hand them to the coding agent: each layer's pull request builds on the branch of the one below, so dependent or same-area changes never conflict and never wait for each other's merge. The platform links them as a GitHub stack, builds every layer, and merges the stack bottom-up once every layer is green; the site rebuilds after the merge. Use it instead of several create_issue calls whenever the changes depend on each other or touch the same files; keep each layer small and independently reviewable.",
+					"Open several issues as ONE stack of layers, bottom first, and hand them to the coding agent: each layer's pull request builds on the branch of the one below, so dependent or same-area changes never conflict and never wait for each other's merge. The platform links them as a GitHub stack and builds every layer; the stack merges bottom-up only through layers a human opted in (set_auto_merge / /auto-agent-merge per issue) once they are green; the site rebuilds after the merge. Use it instead of several create_issue calls whenever the changes depend on each other or touch the same files; keep each layer small and independently reviewable.",
 				route: "stacks/create",
 				destructive: false,
 				input: schema(
@@ -1531,6 +1657,9 @@ const plugin: SandboxedPlugin = {
 						handled[command] = { status: run.status, attempt: run.attempt, reason: run.reason };
 					} else if (command === "agent-stack" && !cmd.isPull) {
 						handled[command] = await handleAgentStack(ctx, setup.settings, setup.conn, cmd.number, cmd.args["agent-stack"] ?? "", cmd.author);
+					} else if (command === "auto-agent-merge") {
+						const on = autoMergeArg(cmd.args["auto-agent-merge"]);
+						handled[command] = await setAutoMerge(ctx, setup.settings, setup.conn, cmd.isPull ? "pr" : "issue", cmd.number, on, `@${cmd.author}`);
 					} else if (command === "awaiting-test" && cmd.isPull) {
 						const pr = await getPull(ctx, setup.conn, cmd.number);
 						if (!pr) return { success: true, ignored: "pull request not found" };
@@ -1697,21 +1826,24 @@ const plugin: SandboxedPlugin = {
 				const labels = Array.isArray(input.labels) ? input.labels.map(String) : [];
 				const text = typeof input.body === "string" ? input.body : "";
 				const agent = input.agent !== false;
+				const autoMerge = agent && input.autoMerge === true;
 				const on = Number.isInteger(Number(input.on)) && Number(input.on) > 0 ? Number(input.on) : null;
 				const issue = await createIssue(ctx, setup.conn, {
 					title,
-					body: agent && !commandsIn(text).includes("agent-issue") ? `${text.trimEnd()}\n\n/agent-issue${on ? ` on #${on}` : ""}` : text,
+					body: issueBodyWithCommands(text, { agent, on, autoMerge }),
 					labels,
 				});
+				if (autoMerge) await setAutoMergeFlag(ctx, "issue", issue.number, true);
 				return {
 					success: true,
 					issue,
 					agent,
+					autoMerge,
 					...(on ? { on } : {}),
 					next: agent
 						? on
-							? `The coding agent starts on it as a layer on top of #${on}'s pull request (from that branch) as soon as GitHub delivers the event; the stack merges bottom-up once every layer is green. Use issue_status to follow it.`
-							: "The coding agent starts when GitHub delivers the event: it opens a pull request, the platform builds and tests it, hosts a preview, and merges it when every check passes; the site rebuilds a minute or two later. Use issue_status to follow it."
+							? `The coding agent starts on it as a layer on top of #${on}'s pull request (from that branch) as soon as GitHub delivers the event; the stack merges bottom-up once every opted-in layer is green. Use issue_status to follow it.`
+							: `The coding agent starts when GitHub delivers the event: it opens a pull request, the platform builds and tests it and hosts a preview; ${autoMerge ? "it merges when every check passes and the site rebuilds a minute or two later" : "once green the pull request waits for a human — set_auto_merge (or /auto-agent-merge on the issue) merges it automatically"}. Use issue_status to follow it.`
 						: "Created without handing it to the agent.",
 				};
 			},
@@ -1760,9 +1892,11 @@ const plugin: SandboxedPlugin = {
 				const pull = (await listBuilds(ctx, 100)).find((b) => b.pr > 0 && b.issue === number) ?? null;
 				const site = await getBranchBuild(ctx, setup.conn.branch);
 				const stack = await stackOf(ctx, run);
+				const autoMerge = (await getAutoMergeFlag(ctx, "issue", number)) || (pull ? await getAutoMergeFlag(ctx, "pr", pull.pr) : false);
 				return {
 					success: true,
 					issue: { number: issue.number, title: issue.title, url: issue.url },
+					autoMerge,
 					agent: run
 						? { status: run.status, attempt: run.attempt, prUrl: run.prUrl ?? null, reason: run.reason ?? null, answer: run.answer ?? null, ...(run.stack ? { stack: run.stack, layer: run.layer ?? null, base: run.base ?? null } : {}) }
 						: { status: "not started" },
@@ -1787,6 +1921,24 @@ const plugin: SandboxedPlugin = {
 				if (!issue) return { success: false, error: `Issue #${number} not found.` };
 				const run = await runIssue(ctx, setup.settings, setup.conn, issue, input.again === true);
 				return { success: run.status !== "error" && run.status !== "skipped", run };
+			},
+		},
+
+		/** Opt an issue in to (or out of) merging automatically; a green pull request merges right away. */
+		"issues/auto-merge": {
+			permission: "content:edit_own",
+			handler: async (routeCtx, ctx) => {
+				const setup = await requireSetup(ctx);
+				if (!setup.ok) return { success: false, error: setup.error };
+				const input = isRecord(routeCtx.input) ? routeCtx.input : {};
+				const number = Number(input.number);
+				if (!Number.isInteger(number) || number <= 0) return { success: false, error: "Issue number required." };
+				const issue = await getIssue(ctx, setup.conn, number);
+				if (!issue) return { success: false, error: `Issue #${number} not found.` };
+				const user: Record<string, unknown> = isRecord(routeCtx.user) ? routeCtx.user : {};
+				const by = typeof user.name === "string" && user.name ? user.name : typeof user.email === "string" && user.email ? user.email : "the admin";
+				const r = await setAutoMerge(ctx, setup.settings, setup.conn, "issue", number, input.enabled !== false, by);
+				return { success: true, number, autoMerge: r.on, pr: r.pr, merged: r.merged, note: r.note };
 			},
 		},
 
@@ -1842,15 +1994,17 @@ const plugin: SandboxedPlugin = {
 					if (!title) return buildPage(ctx, "A title is required.");
 					const text = typeof v.body === "string" ? v.body : "";
 					const on = Number.isInteger(Number(v.on)) && Number(v.on) > 0 ? Number(v.on) : null;
+					const autoMerge = v.agent === true && v.autoMerge === true;
 					try {
 						const issue = await createIssue(ctx, setup.conn, {
 							title,
-							body: v.agent === true ? `${text.trimEnd()}\n\n/agent-issue${on ? ` on #${on}` : ""}` : text,
+							body: issueBodyWithCommands(text, { agent: v.agent === true, on, autoMerge }),
 							labels: [],
 						});
+						if (autoMerge) await setAutoMergeFlag(ctx, "issue", issue.number, true);
 						return buildPage(
 							ctx,
-							`Issue #${issue.number} created${v.agent === true ? ` — the agent starts${on ? ` on top of #${on}'s pull request` : ""} as soon as GitHub delivers the event` : ""}.`,
+							`Issue #${issue.number} created${v.agent === true ? ` — the agent starts${on ? ` on top of #${on}'s pull request` : ""} as soon as GitHub delivers the event; ${autoMerge ? "its pull request merges automatically when green" : "its pull request waits for a human once green"}` : ""}.`,
 						);
 					} catch (error) {
 						return buildPage(ctx, String(error));
@@ -1862,6 +2016,15 @@ const plugin: SandboxedPlugin = {
 					const issues = issueRefs(String(i.values?.issues ?? ""));
 					const r = await startStack(ctx, setup.settings, setup.conn, issues, "admin");
 					return buildPage(ctx, "error" in r ? `Stack not started: ${r.error}.` : `Stack ${describeStack(r.stack)} started (${r.stack.id}) — layer 1 is with the agent.`);
+				}
+				if (i.type === "form_submit" && i.action_id === "set_auto_merge") {
+					const setup = await requireSetup(ctx);
+					if (!setup.ok) return buildPage(ctx, setup.error);
+					const number = Number(i.values?.number);
+					const issue = Number.isInteger(number) && number > 0 ? await getIssue(ctx, setup.conn, number) : null;
+					if (!issue) return buildPage(ctx, `Issue #${number} not found.`);
+					const r = await setAutoMerge(ctx, setup.settings, setup.conn, "issue", number, i.values?.enabled === true, "the admin");
+					return buildPage(ctx, `Issue #${number}: ${r.note}`);
 				}
 				if (i.type === "form_submit" && i.action_id === "run_issue") {
 					const setup = await requireSetup(ctx);
@@ -1932,7 +2095,7 @@ async function buildPage(ctx: PluginContext, notice?: string) {
 	} else {
 		blocks.push({
 			type: "context",
-			text: `Repository ${conn.owner}/${conn.repo} (${conn.branch}). The agent and the builds run inside this site's own instance. Whitelisted users drive the agent with comments: /agent-issue on an issue, /agent-stack #a #b … to run issues as stacked layers (/agent-issue on #N adds a layer), /awaiting-test on a pull request; the runner answers with /check-…, /test-…, /preview-ready, /preview-test-… and /merged${settings.enabled ? "" : " — currently OFF"}.`,
+			text: `Repository ${conn.owner}/${conn.repo} (${conn.branch}). The agent and the builds run inside this site's own instance. Whitelisted users drive the agent with comments: /agent-issue on an issue, /agent-stack #a #b … to run issues as stacked layers (/agent-issue on #N adds a layer), /awaiting-test on a pull request; /auto-agent-merge (or /auto-agent-merge off) on an issue or pull request decides whether its green pull request merges by itself — nothing merges without it. The runner answers with /check-…, /test-…, /preview-ready, /preview-test-… and /merged${settings.enabled ? "" : " — currently OFF"}.`,
 		});
 		if (settings.allowedUsers.length === 0) {
 			blocks.push({
@@ -1951,6 +2114,7 @@ async function buildPage(ctx: PluginContext, notice?: string) {
 			listError = String(error);
 		}
 		const runs = new Map<number, Run>();
+		const optedIn = await autoMergeIssues(ctx);
 		for (const r of await listRuns(ctx, 100)) runs.set(r.number, r);
 
 		const inFlight = [...runs.values()].filter((r) => r.status === "queued" || r.status === "running").length;
@@ -2002,6 +2166,7 @@ async function buildPage(ctx: PluginContext, notice?: string) {
 				{ key: "author", label: "Author", format: "text" },
 				{ key: "labels", label: "Labels", format: "text" },
 				{ key: "agent", label: "Agent", format: "badge" },
+				{ key: "merge", label: "Auto-merge", format: "text" },
 				{ key: "result", label: "Result", format: "text" },
 				{ key: "created", label: "Opened", format: "relative_time" },
 			],
@@ -2013,6 +2178,7 @@ async function buildPage(ctx: PluginContext, notice?: string) {
 					author: `${i.author}${allowed(settings, i.author) ? "" : " (not whitelisted)"}`,
 					labels: i.labels.join(", ") || "-",
 					agent: run ? STATUS_LABEL[run.status] : "-",
+					merge: optedIn.has(i.number) ? "on" : "off",
 					result: run?.prUrl ?? run?.reason ?? run?.answer ?? "",
 					created: i.createdAt,
 				};
@@ -2020,7 +2186,7 @@ async function buildPage(ctx: PluginContext, notice?: string) {
 		});
 		const builds = await listBuilds(ctx, 30);
 		blocks.push({ type: "divider" });
-		blocks.push({ type: "section", text: "Pull requests built by the platform after /awaiting-test (check:cf → build → static/pr-N → test:cf → preview served from that branch → test:preview:cf → /merged)." });
+		blocks.push({ type: "section", text: "Pull requests built by the platform after /awaiting-test (check:cf → build → static/pr-N → test:cf → preview served from that branch → test:preview:cf → /merged when the issue or PR was opted in with /auto-agent-merge; otherwise it waits for a human)." });
 		blocks.push({
 			type: "table",
 			block_id: "pulls",
@@ -2114,6 +2280,13 @@ async function buildPage(ctx: PluginContext, notice?: string) {
 					initial_value: true,
 				},
 				{
+					type: "toggle",
+					action_id: "autoMerge",
+					label: "Merge automatically when green",
+					description: "Your call, not the agent's: ends the issue body with /auto-agent-merge. Off: the pull request stays open for a human once every check passes.",
+					initial_value: false,
+				},
+				{
 					type: "number_input",
 					action_id: "on",
 					label: "Stack on issue # (optional)",
@@ -2132,12 +2305,27 @@ async function buildPage(ctx: PluginContext, notice?: string) {
 			],
 			submit: { label: "Run now", action_id: "run_issue" },
 		});
+		blocks.push({
+			type: "form",
+			block_id: "auto-merge-issue",
+			fields: [
+				{ type: "number_input", action_id: "number", label: "Auto-merge for issue #", min: 1 },
+				{
+					type: "toggle",
+					action_id: "enabled",
+					label: "Merge its pull request automatically when green",
+					description: "Forgot the toggle, or changed your mind: the same as commenting /auto-agent-merge (or /auto-agent-merge off) on the issue. Switching it on merges a pull request that is already green.",
+					initial_value: true,
+				},
+			],
+			submit: { label: "Apply", action_id: "set_auto_merge" },
+		});
 	}
 
 	blocks.push({ type: "divider" });
 	blocks.push({
 		type: "context",
-		text: `${settings.enabled ? "Reacting to /commands" : "Not reacting to /commands (disabled)"} · whitelisted: ${settings.allowedUsers.length ? settings.allowedUsers.join(", ") : "nobody yet"} · ${settings.maxBuildAttempts} build attempts per PR · auto-merge ${settings.autoMerge ? "on" : "off"} · model ${settings.model} (${settings.reasoning}). Change these under Plugins → GitHub Agent → Settings.`,
+		text: `${settings.enabled ? "Reacting to /commands" : "Not reacting to /commands (disabled)"} · whitelisted: ${settings.allowedUsers.length ? settings.allowedUsers.join(", ") : "nobody yet"} · ${settings.maxBuildAttempts} build attempts per PR · automatic merges ${settings.autoMerge ? "allowed (opt-in per issue)" : "blocked"} · model ${settings.model} (${settings.reasoning}). Change these under Plugins → GitHub Agent → Settings.`,
 	});
 	return { blocks };
 }
