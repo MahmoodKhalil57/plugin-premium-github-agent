@@ -27,7 +27,7 @@
 		"@premium-cms/emdash": ">=0.35.27"
 	},
 	"devDependencies": {
-		"@premium-cms/plugin-cli": "^0.8.3",
+		"@premium-cms/plugin-cli": "^0.8.4",
 		"@premium-cms/plugin-types": "^0.3.3",
 		"@premium-cms/emdash": "^0.35.27",
 		"typescript": "^6.0.3",

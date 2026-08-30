@@ -6,7 +6,7 @@
       "name": "premium-cms-plugin-premium-github-agent",
       "devDependencies": {
         "@premium-cms/emdash": "^0.35.27",
-        "@premium-cms/plugin-cli": "^0.8.3",
+        "@premium-cms/plugin-cli": "^0.8.4",
         "@premium-cms/plugin-types": "^0.3.3",
         "typescript": "^6.0.3",
         "vitest": "^4.1.5",
@@ -369,7 +369,7 @@
 
     "@premium-cms/gutenberg-to-portable-text": ["@premium-cms/gutenberg-to-portable-text@0.35.9", "", { "dependencies": { "@wordpress/block-serialization-default-parser": "^5.13.0", "parse5": "^7.2.1" } }, "sha512-kI3EkqhAFZgdZXx6e1zyffO6J0X32IJOZHSuC3FNBgjEaYCD5nXQValeeI+4m6n3OJofXeYO31zpHJADiO3ETg=="],
 
-    "@premium-cms/plugin-cli": ["@premium-cms/plugin-cli@0.8.3", "", { "dependencies": { "@atcute/client": "^5.0.0", "@atcute/identity-resolver": "^2.0.0", "@atcute/lexicons": "^2.0.0", "@atcute/multibase": "^1.2.0", "@atcute/oauth-node-client": "^2.0.0", "@clack/prompts": "^1.4.0", "@oslojs/crypto": "^1.0.1", "@premium-cms/plugin-types": "0.3.3", "@premium-cms/registry-client": "0.3.4", "@premium-cms/registry-lexicons": "0.3.0", "chokidar": "^5.0.0", "citty": "^0.1.6", "consola": "^3.4.2", "jsonc-parser": "^3.3.1", "modern-tar": "^0.7.5", "picocolors": "^1.1.1", "tsdown": "0.20.3", "zod": "^4.4.1" }, "bin": { "emdash-plugin": "./dist/index.mjs" } }, "sha512-ApDiQ0le5D0jZn40MatJnvhgHxnp2yEiE1AduWGD23p5d81C3+rXkKCn5neGWNPq63Lp40DFKcMAAbUsvUPBDg=="],
+    "@premium-cms/plugin-cli": ["@premium-cms/plugin-cli@0.8.4", "", { "dependencies": { "@atcute/client": "^5.0.0", "@atcute/identity-resolver": "^2.0.0", "@atcute/lexicons": "^2.0.0", "@atcute/multibase": "^1.2.0", "@atcute/oauth-node-client": "^2.0.0", "@clack/prompts": "^1.4.0", "@oslojs/crypto": "^1.0.1", "@premium-cms/plugin-types": "0.3.3", "@premium-cms/registry-client": "0.3.4", "@premium-cms/registry-lexicons": "0.3.0", "chokidar": "^5.0.0", "citty": "^0.1.6", "consola": "^3.4.2", "jsonc-parser": "^3.3.1", "modern-tar": "^0.7.5", "picocolors": "^1.1.1", "tsdown": "0.20.3", "zod": "^4.4.1" }, "bin": { "emdash-plugin": "./dist/index.mjs" } }, "sha512-ZU/getwdAFO1J0j4laQsRmuOeJF06d8TBHvQNGDA8cbpAp4QmwCJVrTYmCDv7UBY8c2dfdF9DXrUV2rX7B2VKw=="],
 
     "@premium-cms/plugin-types": ["@premium-cms/plugin-types@0.3.3", "", { "dependencies": { "zod": "^4.4.1" } }, "sha512-FK2RHlfEjvjNo5bNNMz2hSfM/Yzc72XtSQ4+KJZZFhGcYFqVzDwM1R0fmEUyrJEf0mIkCEj+WIQSTBszLr5Bqw=="],
 
