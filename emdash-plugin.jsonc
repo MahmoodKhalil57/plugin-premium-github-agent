@@ -13,10 +13,12 @@
 
 	// The site's own GitHub connection (Settings → General) is the only
 	// credential: issues are read and created with it, and it is handed to the
-	// agent per run so the PR is opened as the site owner. The agent runs on
-	// Cloudflare Workers (never GitHub Actions).
-	"capabilities": ["network:request", "github:connection"],
-	"allowedHosts": ["api.github.com", "*.workers.dev", "*.premium-cms.com"],
+	// agent per run so the PR is opened as the site owner. The agent and the
+	// builds run inside the instance (never GitHub Actions).
+	// agents:run + sandbox:build: the instance's own Think agent and build
+	// sandbox — the plugin's AI and compute never leave the instance.
+	"capabilities": ["network:request", "github:connection", "agents:run", "sandbox:build"],
+	"allowedHosts": ["api.github.com", "*.premium-cms.com"],
 	"storage": {
 		"runs": { "indexes": ["status", "updatedAt", "number"] },
 		"builds": { "indexes": ["status", "updatedAt", "pr"] },

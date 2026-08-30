@@ -17,10 +17,12 @@
  *             plane routes the event by repository → this plugin's `webhook`
  *             route. Issues and PRs are re-read from GitHub before anything
  *             happens, so the event is only ever a hint.
- *   agent     a Cloudflare Worker running a Think agent (Workers AI +
- *             GitHub MCP). It reads the repo, writes a branch, opens a PR and
- *             leaves it open, then calls back (`agent-callback`, HMAC-signed).
- *             No code is ever executed — dry coding only.
+ *   agent     the instance's own Think agent (`ctx.agents`: Workers AI +
+ *             GitHub MCP, hosted by the instance). It reads the repo, writes a
+ *             branch, opens a PR and leaves it open, then calls back
+ *             (`agent-callback`, HMAC-signed with the plugin's own secret).
+ *             No code is ever executed — dry coding only. Builds run in the
+ *             instance's sandbox (`ctx.sandbox`).
  *   site      pushes to the default branch and content publishes rebuild
  *             `static/<branch>` (what GitHub Pages serves). The two previous
  *             deployments stay on `static/<branch>-b-1` / `-b-2`.
@@ -85,7 +87,7 @@ import {
 	type Issue,
 	type PullRequest,
 } from "./github.js";
-import { DEFAULTS, normalizeLogin, readSettings, saveSettings, type Settings } from "./settings.js";
+import { DEFAULTS, ensureAgentKey, normalizeLogin, readSettings, saveSettings, type Settings } from "./settings.js";
 import { decideMerge, describeStack, issueRefs, prNumberFrom, stackId, stackOnArg, type LayerState, type Stack } from "./stacks.js";
 
 const CALLBACK_PATH = "/_emdash/api/plugins/premium-github-agent/agent-callback";
@@ -203,6 +205,7 @@ async function requireSetup(
 ): Promise<{ ok: true; conn: Connection; settings: Settings } | { ok: false; error: string }> {
 	const conn = await getConnection(ctx);
 	if (!conn) return { ok: false, error: "Connect GitHub in Settings → General first." };
+	await ensureAgentKey(ctx);
 	const settings = await readSettings(ctx);
 	return { ok: true, conn, settings };
 }
@@ -1409,6 +1412,7 @@ const plugin: SandboxedPlugin = {
 				if (k === "agentKey" || k === "allowedUsers") continue;
 				if ((await ctx.kv.get(`settings:${k}`)) === null) await ctx.kv.set(`settings:${k}`, v);
 			}
+			await ensureAgentKey(ctx);
 			await ensureTick(ctx);
 			ctx.log.info("GitHub agent installed");
 		},
@@ -1581,13 +1585,14 @@ const plugin: SandboxedPlugin = {
 			public: true,
 			handler: async (routeCtx, ctx) => {
 				const input = isRecord(routeCtx.input) ? routeCtx.input : {};
+				const answer = typeof input.answer === "string" ? input.answer : null;
 				const cb: Callback = {
 					issue: Number(input.issue),
 					attempt: Number(input.attempt),
 					submissionId: String(input.submissionId ?? ""),
 					status: String(input.status ?? ""),
-					answer: typeof input.answer === "string" ? input.answer : null,
-					prUrl: typeof input.prUrl === "string" ? input.prUrl : null,
+					answer,
+					prUrl: typeof input.prUrl === "string" ? input.prUrl : (prUrlFrom(answer) ?? null),
 				};
 				const settings = await readSettings(ctx);
 				const given = headerOf(routeCtx.request, "X-Agent-Signature").replace(/^sha256=/, "");
@@ -1938,7 +1943,7 @@ async function buildPage(ctx: PluginContext, notice?: string) {
 	} else {
 		blocks.push({
 			type: "context",
-			text: `Repository ${conn.owner}/${conn.repo} (${conn.branch}). Whitelisted users drive the agent with comments: /agent-issue on an issue, /agent-stack #a #b … to run issues as stacked layers (/agent-issue on #N adds a layer), /awaiting-test on a pull request; the runner answers with /check-…, /test-…, /preview-ready, /preview-test-… and /merged${settings.enabled ? "" : " — currently OFF"}.`,
+			text: `Repository ${conn.owner}/${conn.repo} (${conn.branch}). The agent and the builds run inside this site's own instance. Whitelisted users drive the agent with comments: /agent-issue on an issue, /agent-stack #a #b … to run issues as stacked layers (/agent-issue on #N adds a layer), /awaiting-test on a pull request; the runner answers with /check-…, /test-…, /preview-ready, /preview-test-… and /merged${settings.enabled ? "" : " — currently OFF"}.`,
 		});
 		if (settings.allowedUsers.length === 0) {
 			blocks.push({
@@ -1946,14 +1951,6 @@ async function buildPage(ctx: PluginContext, notice?: string) {
 				variant: "alert",
 				title: "No whitelisted users",
 				description: "Add GitHub usernames below. The agent only works on issues raised by them.",
-			});
-		}
-		if (!settings.agentKey) {
-			blocks.push({
-				type: "banner",
-				variant: "alert",
-				title: "Agent key missing",
-				description: "Paste the agent worker's key below. Runs stay disabled until it is set.",
 			});
 		}
 
@@ -2175,12 +2172,6 @@ async function buildPage(ctx: PluginContext, notice?: string) {
 				label: "Auto-merge pull requests that pass every check",
 				description: "Squash-merges into the default branch, which rebuilds the site.",
 				initial_value: settings.autoMerge,
-			},
-			{ type: "text_input", action_id: "agentUrl", label: "Agent worker URL", initial_value: settings.agentUrl },
-			{
-				type: "secret_input",
-				action_id: "agentKey",
-				label: settings.agentKey ? "Agent key (set — leave blank to keep)" : "Agent key",
 			},
 			{ type: "text_input", action_id: "model", label: "Model", initial_value: settings.model },
 			{

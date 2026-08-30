@@ -1,13 +1,15 @@
 /**
- * Talks to the agent worker (a Cloudflare Worker running a Think agent with
- * GitHub's MCP server). Every run is keyed by issue number and idempotent on
- * the worker, so re-dispatching is safe.
+ * Talks to the instance's agent runtime (`ctx.agents`, `ctx.sandbox`): a Think
+ * agent with GitHub's MCP server, and the build sandbox, both hosted by the
+ * instance itself. Every run is keyed by issue number and idempotent, so
+ * re-dispatching is safe.
  */
 
 import type { PluginContext } from "@premium-cms/emdash/plugin";
 
 import type { Connection } from "./github.js";
 import type { Settings } from "./settings.js";
+import { FIX_ISSUE_SKILL } from "./skill.js";
 
 export type RunStatus = "waiting" | "queued" | "running" | "completed" | "error" | "skipped";
 
@@ -61,29 +63,40 @@ export function runId(number: number): string {
 	return String(number);
 }
 
-async function call(
-	ctx: PluginContext,
-	settings: Settings,
-	method: "GET" | "POST" | "DELETE",
-	path: string,
-	body?: unknown,
-): Promise<{ ok: boolean; status: number; json: Record<string, unknown> }> {
-	const res = await ctx.http!.fetch(`${settings.agentUrl}${path}`, {
-		method,
-		headers: {
-			Authorization: `Bearer ${settings.agentKey}`,
-			"Content-Type": "application/json",
-			"User-Agent": "premium-cms-github-agent/1.0",
-		},
-		body: body ? JSON.stringify(body) : undefined,
-	});
-	let json: Record<string, unknown> = {};
-	try {
-		json = (await res.json()) as Record<string, unknown>;
-	} catch {
-		json = {};
-	}
-	return { ok: res.ok, status: res.status, json };
+/** The instance's agent runtime, reached through the plugin context (capabilities agents:run + sandbox:build). */
+interface AgentsLike {
+	run(spec: Record<string, unknown>): Promise<{ submissionId: string; accepted: boolean }>;
+	status(id: string, submissionId: string): Promise<{ status: string; answer: string | null }>;
+}
+interface SandboxLike {
+	build(spec: Record<string, unknown>): Promise<{ accepted: true }>;
+	buildStatus(id: string): Promise<{ running: unknown; last: unknown }>;
+}
+
+function agentsOf(ctx: PluginContext): AgentsLike {
+	const agents = (ctx as { agents?: AgentsLike }).agents;
+	if (!agents) throw new Error("This instance does not host the agent runtime (plugin capability agents:run)");
+	return agents;
+}
+
+function sandboxOf(ctx: PluginContext): SandboxLike {
+	const sandbox = (ctx as { sandbox?: SandboxLike }).sandbox;
+	if (!sandbox) throw new Error("This instance does not host a build sandbox (plugin capability sandbox:build)");
+	return sandbox;
+}
+
+const GITHUB_MCP = "https://api.githubcopilot.com/mcp/";
+/** Tools that would take a run past "open a PR" — refused by the runtime even if the model asks. */
+const FORBIDDEN_TOOLS = "merge|delete|close|update_issue|update_pull_request_branch|request_copilot|assign|lock|transfer";
+
+/** The agent lane for an issue: every attempt lands on the same object. */
+export function agentIdFor(issue: number): string {
+	return `issue-${issue}`;
+}
+
+/** The build lane: one per pull request, one per built branch. */
+export function buildIdFor(target: { pr: number; headRef?: string }): string {
+	return target.pr > 0 ? `pr-${target.pr}` : `branch-${(target.headRef ?? "").replace(/[^A-Za-z0-9._-]+/g, "-")}`;
 }
 
 export interface CiStep {
@@ -171,7 +184,7 @@ export function canonicalStage(r: CiStageReport): string {
 	});
 }
 
-/** Start a PR build; the worker accepts it and POSTs the result to `ci-callback` when done. */
+/** Start a build in the instance's sandbox; the runtime posts stage reports to `ci-stage` and the result to `ci-callback`, both signed. */
 export async function dispatchCi(
 	ctx: PluginContext,
 	settings: Settings,
@@ -193,66 +206,77 @@ export async function dispatchCi(
 		previousUrls?: Array<string | null>;
 	},
 ): Promise<void> {
-	const r = await call(ctx, settings, "POST", "/ci", {
+	const { callbackUrl: _url, ...build } = input;
+	const r = await sandboxOf(ctx).build({
+		id: buildIdFor(input),
 		owner: conn.owner,
 		repo: conn.repo,
 		token: conn.token,
 		previewSecret: conn.previewSecret,
-		...input,
+		...build,
+		callback: { route: "ci-callback", secret: settings.agentKey },
+		stageRoute: "ci-stage",
 	});
-	if (!r.ok || r.json.accepted !== true) {
-		throw new Error(`agent ${r.status}: ${String(r.json.error ?? "ci was not accepted")}`);
-	}
+	if (r.accepted !== true) throw new Error("the build was not accepted");
 }
 
+/** What the run reports through `agent-callback`: `{issue, attempt}` come back as given, the rest from the runtime. */
 export async function dispatch(
 	ctx: PluginContext,
 	settings: Settings,
 	conn: Connection,
 	issue: number,
 	attempt: number,
-	callbackUrl: string,
+	_callbackUrl: string,
 	note?: string,
 	stacked?: StackedRun,
 ): Promise<{ submissionId: string; accepted: boolean }> {
-	const r = await call(ctx, settings, "POST", "/run", {
-		owner: conn.owner,
-		repo: conn.repo,
-		branch: conn.branch,
-		issue,
-		token: conn.token,
+	const stackLine = stacked
+		? stacked.base && stacked.below
+			? `Stacked pull requests: this issue is layer ${stacked.layer} of ${stacked.size}. Create your branch from \`${stacked.base}\` — the branch of pull request #${stacked.below.pr}, which implements #${stacked.below.issue} and is not merged yet — instead of the default branch, and open your pull request against \`${stacked.base}\` (base), not against ${conn.branch}. Build on what is already there; do not rework what #${stacked.below.issue} changed unless this issue requires it. The platform links the pull request into the stack and merges the stack bottom-up — do not merge, retarget or rebase anything.`
+			: `Stacked pull requests: this issue is layer ${stacked.layer} of ${stacked.size} and starts from the default branch as usual; the layers above will build on your branch, so keep the change self-contained and do not touch what they are meant to do.`
+		: "";
+	const input = [
+		`Repository: ${conn.owner}/${conn.repo} (default branch: ${conn.branch})`,
+		`Issue: #${issue}`,
+		"",
+		attempt > 1
+			? `This is attempt ${attempt}. Re-read the issue and the repository state (branches and pull requests you opened earlier may exist — reuse or correct them rather than duplicating). Fix this issue and open or update a pull request. Do not merge it.`
+			: "Fix this issue and open a pull request. Do not merge it.",
+		...(stackLine ? ["", stackLine] : []),
+		...(note ? ["", note.slice(0, 12_000)] : []),
+	].join("\n");
+	return agentsOf(ctx).run({
+		id: agentIdFor(issue),
 		model: settings.model,
 		reasoning: settings.reasoning,
-		attempt,
-		callbackUrl,
-		...(note ? { note } : {}),
-		...(stacked ? { base: stacked.base, stack: { layer: stacked.layer, size: stacked.size, below: stacked.below } } : {}),
+		systemPrompt: "You fix GitHub issues by opening pull requests. Activate the fix-github-issue skill and follow it exactly. You cannot run code.",
+		skills: [FIX_ISSUE_SKILL],
+		mcp: [
+			{
+				name: "github",
+				url: GITHUB_MCP,
+				headers: { Authorization: `Bearer ${conn.token}`, "X-MCP-Toolsets": "repos,issues,pull_requests" },
+			},
+		],
+		repo: { owner: conn.owner, repo: conn.repo, branch: conn.branch, token: conn.token },
+		input,
+		idempotencyKey: `issue-${issue}-attempt-${attempt}`,
+		forbidTools: FORBIDDEN_TOOLS,
+		maxSteps: 80,
+		callback: { route: "agent-callback", secret: settings.agentKey, data: { issue, attempt } },
 	});
-	if (!r.ok || typeof r.json.submissionId !== "string") {
-		throw new Error(`agent ${r.status}: ${String(r.json.error ?? "no submission id")}`);
-	}
-	return { submissionId: r.json.submissionId, accepted: r.json.accepted !== false };
 }
 
 export async function status(
 	ctx: PluginContext,
-	settings: Settings,
-	conn: Connection,
+	_settings: Settings,
+	_conn: Connection,
 	issue: number,
 	submissionId: string,
 ): Promise<{ status: string; answer: string | null }> {
-	const q = new URLSearchParams({
-		owner: conn.owner,
-		repo: conn.repo,
-		issue: String(issue),
-		submission: submissionId,
-	});
-	const r = await call(ctx, settings, "GET", `/status?${q}`);
-	if (!r.ok) throw new Error(`agent ${r.status}: ${String(r.json.error ?? "status failed")}`);
-	return {
-		status: String(r.json.status ?? "unknown"),
-		answer: typeof r.json.answer === "string" ? r.json.answer : null,
-	};
+	const r = await agentsOf(ctx).status(agentIdFor(issue), submissionId);
+	return { status: String(r.status ?? "unknown"), answer: typeof r.answer === "string" ? r.answer : null };
 }
 
 /** Pull the PR link out of the agent's final answer, if it opened one. */
@@ -263,17 +287,17 @@ export function prUrlFrom(answer: string | null | undefined): string | undefined
 }
 
 /**
- * The callback is signed over the canonical JSON of its six fields, in this
- * order, so it can be checked from the parsed body (routes never see raw bytes).
+ * The runtime signs `JSON.stringify({ ...data, submissionId, status, answer })`
+ * with `data = {issue, attempt}` as handed to it; the same shape is rebuilt here
+ * (routes never see raw bytes). `prUrl` is derived from the answer, not signed.
  */
-export function canonicalCallback(c: Callback): string {
+export function canonicalCallback(c: Pick<Callback, "issue" | "attempt" | "submissionId" | "status" | "answer">): string {
 	return JSON.stringify({
 		issue: c.issue,
 		attempt: c.attempt,
 		submissionId: c.submissionId,
 		status: c.status,
 		answer: c.answer,
-		prUrl: c.prUrl,
 	});
 }
 
@@ -296,19 +320,16 @@ export function timingSafeEqual(a: string, b: string): boolean {
 	return diff === 0;
 }
 
-/** The worker's record of a build: what is running and the last finished result. */
+/** The runtime's record of a build lane: what is running and the last finished result. */
 export async function ciStatus(
 	ctx: PluginContext,
-	settings: Settings,
-	conn: Connection,
+	_settings: Settings,
+	_conn: Connection,
 	target: { pr: number; branch?: string },
 ): Promise<{ running: { attempt: number } | null; last: CiResult | null }> {
-	const q = new URLSearchParams({ owner: conn.owner, repo: conn.repo, pr: String(target.pr) });
-	if (target.branch) q.set("branch", target.branch);
-	const r = await call(ctx, settings, "GET", `/ci/status?${q}`);
-	if (!r.ok) throw new Error(`agent ${r.status}: ${String(r.json.error ?? "status failed")}`);
+	const r = await sandboxOf(ctx).buildStatus(buildIdFor({ pr: target.pr, headRef: target.branch }));
 	return {
-		running: (r.json.running as { attempt: number } | null) ?? null,
-		last: (r.json.last as CiResult | null) ?? null,
+		running: (r.running as { attempt: number } | null) ?? null,
+		last: (r.last as CiResult | null) ?? null,
 	};
 }

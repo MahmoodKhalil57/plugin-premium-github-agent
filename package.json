@@ -1,6 +1,6 @@
 {
 	"name": "premium-cms-plugin-premium-github-agent",
-	"version": "0.2.5",
+	"version": "0.3.0",
 	"type": "module",
 	"description": "PremiumCMS GitHub Agent: issues on the connected repo + a Cloudflare-hosted coding agent that opens fix PRs",
 	"main": "dist/index.mjs",

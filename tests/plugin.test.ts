@@ -59,6 +59,16 @@ function ctxWith(opts: {
 			},
 		},
 		log: { debug() {}, info() {}, warn() {}, error() {} },
+		// The instance's runtime, as the plugin sees it: specs travel through the
+		// same fetch double as pseudo-URLs so tests can inspect and answer them.
+		agents: {
+			run: async (spec: Record<string, unknown>) => (await ctx.http.fetch("agents:run", { method: "POST", body: JSON.stringify(spec) })).json(),
+			status: async (id: string, submissionId: string) => (await ctx.http.fetch(`agents:status?${id}&${submissionId}`, { method: "GET" })).json(),
+		},
+		sandbox: {
+			build: async (spec: Record<string, unknown>) => (await ctx.http.fetch("sandbox:build", { method: "POST", body: JSON.stringify(spec) })).json(),
+			buildStatus: async (id: string) => (await ctx.http.fetch(`sandbox:status?${id}`, { method: "GET" })).json(),
+		},
 	};
 	return { ctx, store, builds, stacks, calls, crons };
 }
@@ -100,15 +110,17 @@ describe("/agent-issue", () => {
 			settings,
 			fetch: async (url) => {
 				if (url.endsWith("/issues/1")) return Response.json(issue(1, "alice"));
-				if (url.endsWith("/run")) return Response.json({ submissionId: "sub-1", accepted: true });
+				if (url === "agents:run") return Response.json({ submissionId: "sub-1", accepted: true });
 				return Response.json({});
 			},
 		});
 		const r = (await route("webhook")(commentEvent(1, "alice", "please look at this\n/agent-issue"), ctx)) as { handled: Record<string, { status: string }> };
 		expect(r.handled["agent-issue"].status).toBe("queued");
 		expect(store.get("1")?.submissionId).toBe("sub-1");
-		const body = JSON.parse(String(calls.find((c) => c.url.endsWith("/run"))?.init?.body));
-		expect(body).toMatchObject({ owner: "acme", repo: "site", issue: 1, token: "gho_x", attempt: 1, callbackUrl: "https://site.example/_emdash/api/plugins/premium-github-agent/agent-callback" });
+		const body = JSON.parse(String(calls.find((c) => c.url === "agents:run")?.init?.body));
+		expect(body).toMatchObject({ id: "issue-1", repo: { owner: "acme", repo: "site", branch: "main", token: "gho_x" }, idempotencyKey: "issue-1-attempt-1", callback: { route: "agent-callback", data: { issue: 1, attempt: 1 } } });
+		expect(body.mcp[0]).toMatchObject({ name: "github", headers: { Authorization: "Bearer gho_x" } });
+		expect(body.input).toMatch(/Issue: #1/);
 	});
 
 	it("also works from the body of a newly opened issue", async () => {
@@ -117,7 +129,7 @@ describe("/agent-issue", () => {
 			settings,
 			fetch: async (url) => {
 				if (url.endsWith("/issues/2")) return Response.json(issue(2, "alice", "fix it\n/agent-issue"));
-				if (url.endsWith("/run")) return Response.json({ submissionId: "s2", accepted: true });
+				if (url === "agents:run") return Response.json({ submissionId: "s2", accepted: true });
 				return Response.json({});
 			},
 		});
@@ -133,7 +145,7 @@ describe("/agent-issue", () => {
 		expect(b.ignored).toBe("no command");
 		const c = (await route("webhook")({ input: { action: "edited", issue: { number: 3 }, comment: { body: "/agent-issue", user: { login: "alice" } } } }, ctx)) as { ignored: string };
 		expect(c.ignored).toBe("no command");
-		expect(calls.some((c) => c.url.endsWith("/run"))).toBe(false);
+		expect(calls.some((c) => c.url === "agents:run")).toBe(false);
 	});
 
 	it("a second /agent-issue on a finished issue is a new attempt", async () => {
@@ -143,7 +155,7 @@ describe("/agent-issue", () => {
 			settings,
 			fetch: async (url, init) => {
 				if (url.endsWith("/issues/4")) return Response.json(issue(4, "alice"));
-				if (url.endsWith("/run")) {
+				if (url === "agents:run") {
 					attempts.push(JSON.parse(String(init?.body)).attempt);
 					return Response.json({ submissionId: `s${attempts.length}`, accepted: true });
 				}
@@ -163,7 +175,7 @@ describe("/awaiting-test and the runner's reports", () => {
 	const passing = (n: number) => async (url: string, init?: RequestInit) => {
 		if (url.endsWith(`/pulls/${n}`)) return Response.json(pull(n, "alice", "agent/issue-1-x"));
 		if (url.endsWith(`/pulls/${n}/merge`)) return Response.json({ merged: true, sha: "merged1" });
-		if (url.endsWith("/ci")) return Response.json({ accepted: true }, { status: 202 });
+		if (url === "sandbox:build") return Response.json({ accepted: true }, { status: 202 });
 		return Response.json({});
 	};
 
@@ -171,7 +183,7 @@ describe("/awaiting-test and the runner's reports", () => {
 		const { ctx, builds, calls } = ctxWith({ github: conn, settings, fetch: passing(10) });
 		const r = (await route("webhook")(commentEvent(10, "alice", "Changed the footer.\n/awaiting-test", true), ctx)) as { handled: Record<string, { started: boolean }> };
 		expect(r.handled["awaiting-test"].started).toBe(true);
-		const ci = JSON.parse(String(calls.find((c) => c.url.endsWith("/ci"))?.init?.body));
+		const ci = JSON.parse(String(calls.find((c) => c.url === "sandbox:build")?.init?.body));
 		expect(ci).toMatchObject({ pr: 10, headRef: "agent/issue-1-x", staticBranch: "static/pr-10", attempt: 1, previewUrl: "https://p01abcdefghijklmnopqrstuvwxy--pr-10.premium-cms.com" });
 
 		const stage = (stage: string, ok: boolean, previewUrl: string | null = null) =>
@@ -197,7 +209,7 @@ describe("/awaiting-test and the runner's reports", () => {
 		const { ctx, calls } = ctxWith({ github: conn, settings, fetch: passing(11) });
 		const r = (await route("webhook")({ input: { action: "opened", pull_request: pull(11, "alice", "feature"), repository: { full_name: "acme/site" } } }, ctx)) as { ignored: string };
 		expect(r.ignored).toBe("pull_request opened");
-		expect(calls.some((c) => c.url.endsWith("/ci"))).toBe(false);
+		expect(calls.some((c) => c.url === "sandbox:build")).toBe(false);
 	});
 
 	it("a /…-failed report on an agent PR sends the agent back with the output, until the cap", async () => {
@@ -208,8 +220,8 @@ describe("/awaiting-test and the runner's reports", () => {
 			fetch: async (url, init) => {
 				if (url.endsWith("/pulls/12")) return Response.json(pull(12, "alice", "agent/issue-1-x"));
 				if (url.endsWith("/issues/1")) return Response.json(issue(1, "alice"));
-				if (url.endsWith("/ci")) return Response.json({ accepted: true }, { status: 202 });
-				if (url.endsWith("/run")) {
+				if (url === "sandbox:build") return Response.json({ accepted: true }, { status: 202 });
+				if (url === "agents:run") {
 					runs.push(JSON.parse(String(init?.body)).note ?? "");
 					return Response.json({ submissionId: `s${runs.length}`, accepted: true });
 				}
@@ -245,7 +257,7 @@ describe("/awaiting-test and the runner's reports", () => {
 		expect(r.handled["check-failed"].started).toBe(false);
 		const ok = (await route("webhook")(commentEvent(13, "alice", "/check-succeeded", true), ctx)) as { handled: Record<string, unknown> };
 		expect(Object.keys(ok.handled)).toEqual([]);
-		expect(calls.some((c) => c.url.endsWith("/run") || c.url.endsWith("/ci"))).toBe(false);
+		expect(calls.some((c) => c.url === "agents:run" || c.url === "sandbox:build")).toBe(false);
 	});
 
 	it("reports a platform error that stopped the run before any stage, without summoning the agent", async () => {
@@ -275,7 +287,7 @@ describe("/awaiting-test and the runner's reports", () => {
 			settings: { ...settings, autoMerge: false },
 			fetch: async (url, init) => {
 				if (url.endsWith("/pulls/14")) return Response.json(pull(14, "alice", "feature"));
-				if (url.endsWith("/ci")) return Response.json({ accepted: true }, { status: 202 });
+				if (url === "sandbox:build") return Response.json({ accepted: true }, { status: 202 });
 				if (url.endsWith("/git/refs/heads/static/pr-14") && init?.method === "DELETE") return new Response(null, { status: 204 });
 				return Response.json({});
 			},
@@ -337,7 +349,7 @@ describe("default branch", () => {
 			settings,
 			fetch: async (url, init) => {
 				if (url.endsWith("/branches/main")) return Response.json({ commit: { sha: "mainsha" } });
-				if (url.endsWith("/ci")) return Response.json({ accepted: true }, { status: 202 });
+				if (url === "sandbox:build") return Response.json({ accepted: true }, { status: 202 });
 				if (url.endsWith("/pages")) {
 					if ((init?.method ?? "GET") === "GET") return Response.json({ build_type: "workflow", source: { branch: "main", path: "/" }, html_url: "https://acme.github.io/site/" });
 					pagesCalls.push({ method: init?.method, body: JSON.parse(String(init?.body)) });
@@ -348,7 +360,7 @@ describe("default branch", () => {
 		});
 		const r = (await route("webhook")({ input: { ref: "refs/heads/main", after: "mainsha", repository: { full_name: "acme/site" } } }, ctx)) as { started: boolean };
 		expect(r.started).toBe(true);
-		const ci = JSON.parse(String(calls.find((c) => c.url.endsWith("/ci"))?.init?.body));
+		const ci = JSON.parse(String(calls.find((c) => c.url === "sandbox:build")?.init?.body));
 		expect(ci).toMatchObject({ pr: 0, headRef: "main", staticBranch: "static/main", previousUrls: ["https://p01abcdefghijklmnopqrstuvwxy--main-b-1.premium-cms.com", "https://p01abcdefghijklmnopqrstuvwxy--main-b-2.premium-cms.com"], previous: 2 });
 		await route("ci-callback")(await signed(branchResult(1, true), canonicalCi), ctx);
 		expect(builds.get("branch:main")).toMatchObject({ status: "passed", staticSha: "stat123" });
@@ -361,7 +373,7 @@ describe("default branch", () => {
 			settings,
 			fetch: async (url, init) => {
 				if (url.endsWith("/branches/main")) return Response.json({ commit: { sha: "mainsha" } });
-				if (url.endsWith("/ci")) return Response.json({ accepted: true }, { status: 202 });
+				if (url === "sandbox:build") return Response.json({ accepted: true }, { status: 202 });
 				if (url.endsWith("/pages") && (init?.method ?? "GET") === "GET") return Response.json({ build_type: "legacy", source: { branch: "static/main", path: "/" }, html_url: "https://acme.github.io/site/" });
 				return Response.json({});
 			},
@@ -392,7 +404,7 @@ describe("default branch", () => {
 			settings,
 			fetch: async (url, init) => {
 				if (url.endsWith("/branches/main")) return Response.json({ commit: { sha: "mainsha" } });
-				if (url.endsWith("/ci")) return Response.json({ accepted: true }, { status: 202 });
+				if (url === "sandbox:build") return Response.json({ accepted: true }, { status: 202 });
 				if (url.endsWith("/pages") && (init?.method ?? "GET") === "GET") return Response.json({ build_type: "legacy", source: { branch: "static/main", path: "/" }, html_url: "https://acme.github.io/site/" });
 				return Response.json({});
 			},
@@ -415,10 +427,10 @@ describe("default branch", () => {
 	});
 
 	it("computes no preview URLs for a site served at the platform zone itself", async () => {
-		const { ctx, calls } = ctxWith({ github: conn, settings, fetch: async (url) => (url.endsWith("/ci") ? Response.json({ accepted: true }, { status: 202 }) : url.endsWith("/branches/main") ? Response.json({ commit: { sha: "mainsha" } }) : Response.json({})) });
+		const { ctx, calls } = ctxWith({ github: conn, settings, fetch: async (url) => (url === "sandbox:build" ? Response.json({ accepted: true }, { status: 202 }) : url.endsWith("/branches/main") ? Response.json({ commit: { sha: "mainsha" } }) : Response.json({})) });
 		(ctx.site as { platformUrl?: string }).platformUrl = "https://premium-cms.com";
 		await route("webhook")({ input: { ref: "refs/heads/main", after: "mainsha", repository: { full_name: "acme/site" } } }, ctx);
-		const ci = JSON.parse(String(calls.find((c) => c.url.endsWith("/ci"))?.init?.body));
+		const ci = JSON.parse(String(calls.find((c) => c.url === "sandbox:build")?.init?.body));
 		expect(ci.previousUrls).toEqual([null, null]);
 	});
 
@@ -427,7 +439,7 @@ describe("default branch", () => {
 		for (const ref of ["refs/heads/static/main", "refs/heads/feature", "refs/tags/v1"]) {
 			await route("webhook")({ input: { ref, after: "x", repository: { full_name: "acme/site" } } }, ctx);
 		}
-		expect(calls.some((c) => c.url.endsWith("/ci"))).toBe(false);
+		expect(calls.some((c) => c.url === "sandbox:build")).toBe(false);
 	});
 
 	it("coalesces a publish during a running build into one rebuild", async () => {
@@ -437,7 +449,7 @@ describe("default branch", () => {
 			settings,
 			fetch: async (url, init) => {
 				if (url.endsWith("/branches/main")) return Response.json({ commit: { sha: "mainsha" } });
-				if (url.endsWith("/ci")) {
+				if (url === "sandbox:build") {
 					ciCalls++;
 					return Response.json({ accepted: true }, { status: 202 });
 				}
@@ -486,9 +498,18 @@ function fakeGitHub(init: { issues?: Record<number, ReturnType<typeof issue>>; p
 		}
 	};
 	const fetch = async (url: string, init?: RequestInit) => {
+		const body = init?.body ? (JSON.parse(String(init.body)) as Record<string, unknown>) : {};
+		if (url === "agents:run") {
+			state.runs.push(body);
+			return Response.json({ submissionId: `s${state.runs.length}`, accepted: true });
+		}
+		if (url === "sandbox:build") {
+			state.ci.push(body);
+			return Response.json({ accepted: true });
+		}
+		if (url.startsWith("agents:status") || url.startsWith("sandbox:status")) return Response.json({ status: "running", running: null, last: null });
 		const path = new URL(url).pathname;
 		const method = init?.method ?? "GET";
-		const body = init?.body ? (JSON.parse(String(init.body)) as Record<string, unknown>) : {};
 		let m: RegExpMatchArray | null;
 		if ((m = path.match(/\/issues\/(\d+)\/sub_issues$/))) return Response.json((state.subIssues[+m[1]] ?? []).map((n) => state.issues[n]));
 		if ((m = path.match(/\/issues\/(\d+)$/)) && method === "GET") return state.issues[+m[1]] ? Response.json(state.issues[+m[1]]) : Response.json({}, { status: 404 });
@@ -532,14 +553,6 @@ function fakeGitHub(init: { issues?: Record<number, ReturnType<typeof issue>>; p
 			if (state.asyncMerge === "enqueued") return Response.json({ status: "enqueued" });
 			markMerged(+m[1]);
 			return Response.json({ status: "merged", details: { sha: "mmmmmmm" } });
-		}
-		if (path.endsWith("/run")) {
-			state.runs.push(body);
-			return Response.json({ submissionId: `s${state.runs.length}`, accepted: true });
-		}
-		if (path.endsWith("/ci")) {
-			state.ci.push(body);
-			return Response.json({ accepted: true }, { status: 202 });
 		}
 		return Response.json({});
 	};
@@ -601,8 +614,9 @@ describe("/agent-stack", () => {
 		const r = (await route("webhook")(commentEvent(1, "alice", "/agent-stack #1 #2"), ctx)) as { handled: Record<string, { started: boolean; issues: number[] }> };
 		expect(r.handled["agent-stack"]).toMatchObject({ started: true, issues: [1, 2] });
 		expect(gh.state.runs).toHaveLength(1);
-		expect(gh.state.runs[0]).toMatchObject({ issue: 1, stack: { layer: 1, size: 2 } });
-		expect(gh.state.runs[0].base).toBeUndefined();
+		expect(gh.state.runs[0]).toMatchObject({ id: "issue-1" });
+		expect(String(gh.state.runs[0].input)).toMatch(/layer 1 of 2/);
+		expect(String(gh.state.runs[0].input)).not.toMatch(/Create your branch from/);
 		expect(store.get("1")).toMatchObject({ status: "queued", layer: 1 });
 		expect(store.get("2")).toMatchObject({ status: "waiting", layer: 2 });
 		expect(commentsPosted(calls, 2)[0]).toMatch(/layer 2 of 2/);
@@ -614,7 +628,10 @@ describe("/agent-stack", () => {
 		gh.state.pulls[10] = spull(10, "agent/issue-1-x");
 		await callback(ctx, 1, "s1", "https://github.com/acme/site/pull/10");
 		expect(gh.state.runs).toHaveLength(2);
-		expect(gh.state.runs[1]).toMatchObject({ issue: 2, base: "agent/issue-1-x", stack: { layer: 2, size: 2, below: { issue: 1, pr: 10, branch: "agent/issue-1-x" } } });
+		expect(gh.state.runs[1]).toMatchObject({ id: "issue-2" });
+		expect(String(gh.state.runs[1].input)).toMatch(/layer 2 of 2/);
+		expect(String(gh.state.runs[1].input)).toMatch(/branch from `agent\/issue-1-x`/);
+		expect(String(gh.state.runs[1].input)).toMatch(/pull request #10/);
 		expect(store.get("2")).toMatchObject({ status: "queued", base: "agent/issue-1-x" });
 
 		// Layer 2 opens PR 11 on top: the pair becomes a GitHub stack.
@@ -711,7 +728,7 @@ describe("/agent-stack", () => {
 		const { ctx, store } = ctxWith({ github: conn, settings, fetch: gh.fetch });
 		const r = (await route("webhook")(commentEvent(7, "alice", "/agent-stack"), ctx)) as { handled: Record<string, { started: boolean; issues: number[] }> };
 		expect(r.handled["agent-stack"]).toMatchObject({ started: true, issues: [9, 8] });
-		expect(gh.state.runs[0]).toMatchObject({ issue: 9 });
+		expect(gh.state.runs[0]).toMatchObject({ id: "issue-9" });
 		expect(store.get("8")).toMatchObject({ status: "waiting", layer: 2 });
 		expect(store.get("7")).toBeUndefined();
 	});
@@ -770,7 +787,9 @@ describe("/agent-stack", () => {
 		store.set("5", { number: 5, title: "Issue 5", author: "alice", status: "completed", prUrl: "https://github.com/acme/site/pull/30", attempt: 1, updatedAt: "2026-01-01T00:00:00Z" });
 		const r = (await route("webhook")(commentEvent(6, "alice", "/agent-issue on #5"), ctx)) as { handled: Record<string, { started: boolean; layer: number }> };
 		expect(r.handled["agent-issue"]).toMatchObject({ started: true, layer: 2 });
-		expect(gh.state.runs[0]).toMatchObject({ issue: 6, base: "agent/issue-5-a", stack: { layer: 2, size: 2, below: { issue: 5, pr: 30 } } });
+		expect(gh.state.runs[0]).toMatchObject({ id: "issue-6" });
+		expect(String(gh.state.runs[0].input)).toMatch(/branch from `agent\/issue-5-a`/);
+		expect(String(gh.state.runs[0].input)).toMatch(/pull request #30/);
 		const stack = [...stacks.values()][0] as { issues: number[]; prs: Record<string, number> };
 		expect(stack).toMatchObject({ issues: [5, 6], prs: { "5": 30 } });
 		expect(store.get("5")).toMatchObject({ stack: expect.any(String), layer: 1 });
@@ -795,7 +814,7 @@ describe("/agent-stack", () => {
 		expect(r.success).toBe(true);
 		expect(r.issues.map((i) => i.number)).toEqual([1, 2]);
 		expect(r.stack.layers.map((l) => l.issue)).toEqual([1, 2]);
-		expect(gh.state.runs[0]).toMatchObject({ issue: 1 });
+		expect(gh.state.runs[0]).toMatchObject({ id: "issue-1" });
 		expect(store.get("2")).toMatchObject({ status: "waiting" });
 		expect((plugin.routes!["stacks/create"] as { permission?: string }).permission).toBe("content:edit_own");
 	});
