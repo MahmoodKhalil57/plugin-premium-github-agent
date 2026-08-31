@@ -208,7 +208,8 @@ export async function dispatchCi(
 ): Promise<void> {
 	const { callbackUrl: _url, ...build } = input;
 	const r = await sandboxOf(ctx).build({
-		id: buildIdFor(input),
+		// Per-attempt lane: a wedged run must never jam later attempts.
+		id: `${buildIdFor(input)}-a${input.attempt}`,
 		owner: conn.owner,
 		repo: conn.repo,
 		token: conn.token,

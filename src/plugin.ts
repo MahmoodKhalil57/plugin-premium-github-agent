@@ -790,7 +790,9 @@ async function buildDefaultBranch(
 	const branch = conn.branch;
 	const existing = await getBranchBuild(ctx, branch);
 	if (existing?.status === "running" && !isStale(existing)) {
-		await putBuild(ctx, { ...existing, rebuild: true });
+		// Queue at most once: putBuild stamps updatedAt, and repeated kicks
+		// would keep a dead run looking fresh forever.
+		if (!existing.rebuild) await putBuild(ctx, { ...existing, rebuild: true });
 		return { started: false, reason: "build in progress — queued a rebuild" };
 	}
 	const sha = (await branchHead(ctx, conn, branch)) ?? "";
